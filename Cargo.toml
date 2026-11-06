@@ -1,0 +1,22 @@
+[package]
+name = "fsm-forge"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "A dependency-free state machine engine: edges, scoped rules, diagnostics, and build-time validation."
+keywords = ["fsm", "state-machine", "workflow", "transitions"]
+categories = ["rust-patterns"]
+license = "MIT"
+repository = "https://github.com/rafael-arreola/fsm-forge"
+homepage = "https://github.com/rafael-arreola/fsm-forge"
+documentation = "https://docs.rs/fsm-forge"
+readme = "README.md"
+
+[dependencies]
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
