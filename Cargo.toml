@@ -11,6 +11,7 @@ repository = "https://github.com/rafael-arreola/fsm-forge"
 homepage = "https://github.com/rafael-arreola/fsm-forge"
 documentation = "https://docs.rs/fsm-forge"
 readme = "README.md"
+exclude = [".github/*"]
 
 [dependencies]
 

@@ -1,0 +1,201 @@
+name: "Release: Create Pull Request"
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_bump:
+        description: "Tipo de incremento de versión (SemVer)"
+        required: true
+        default: "patch"
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      custom_version:
+        description: "Versión personalizada (opcional, sobreescribe el incremento. Ej. 1.0.0). Puede ser igual a la de Cargo.toml para publicarla tal cual."
+        required: false
+        type: string
+
+jobs:
+  create-pr:
+    name: Bump Version & Create PR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Manual Git Checkout
+        run: |
+          # Clonar de forma manual el repositorio usando el token de GitHub
+          git clone "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" .
+          git checkout "$GITHUB_REF_NAME"
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Bump Version in Cargo.toml, README.md & CHANGELOG.md
+        id: bump_version
+        env:
+          # Los inputs llegan como variables de entorno, nunca interpolados en el código:
+          # así un valor como `1.0.0"; ...` no puede inyectar instrucciones en el script.
+          BUMP: ${{ inputs.version_bump }}
+          CUSTOM_VERSION: ${{ inputs.custom_version }}
+        run: |
+          python3 - <<'PY'
+          import datetime
+          import os
+          import re
+          import sys
+
+          SEMVER = re.compile(
+              r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+              r"(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
+          )
+
+
+          def fail(message):
+              print(f"::error::{message}")
+              sys.exit(1)
+
+
+          bump = os.environ["BUMP"]
+          custom = os.environ.get("CUSTOM_VERSION", "").strip()
+          if custom and not SEMVER.match(custom):
+              fail(f"custom_version '{custom}' no es una versión SemVer válida (ej. 1.2.3)")
+
+          # 1. Cargo.toml: el campo `version` de la sección [package]
+          with open("Cargo.toml") as f:
+              lines = f.readlines()
+
+          in_package = False
+          current = new = None
+          for i, line in enumerate(lines):
+              stripped = line.strip()
+              if stripped.startswith("["):
+                  in_package = stripped == "[package]"
+                  continue
+              match = re.match(r'version\s*=\s*"([^"]+)"', stripped)
+              if in_package and match:
+                  current = match.group(1)
+                  if custom:
+                      new = custom
+                  else:
+                      parts = re.match(r"(\d+)\.(\d+)\.(\d+)", current)
+                      if not parts:
+                          fail(f"La versión actual '{current}' no es SemVer")
+                      major, minor, patch = map(int, parts.groups())
+                      if bump == "major":
+                          major, minor, patch = major + 1, 0, 0
+                      elif bump == "minor":
+                          minor, patch = minor + 1, 0
+                      else:
+                          patch += 1
+                      new = f"{major}.{minor}.{patch}"
+                  lines[i] = f'version = "{new}"\n'
+                  break
+
+          if current is None:
+              fail("No se encontró el campo version en la sección [package] de Cargo.toml")
+
+          with open("Cargo.toml", "w") as f:
+              f.writelines(lines)
+
+          # 2. README.md: `fsm-forge = "0.1"` conserva su precisión (mayor.menor o completa)
+          major, minor = new.split(".")[:2]
+
+
+          def dependency(match):
+              precision = match.group(1).count(".")
+              value = new if precision >= 2 else f"{major}.{minor}"
+              return f'fsm-forge = "{value}"'
+
+
+          with open("README.md") as f:
+              readme = f.read()
+          readme, count = re.subn(r'fsm-forge = "([^"]+)"', dependency, readme)
+          with open("README.md", "w") as f:
+              f.write(readme)
+          print(f"README.md: {count} referencia(s) actualizada(s)")
+
+          # 3. CHANGELOG.md: lo acumulado en [Unreleased] pasa a la nueva versión
+          heading = "## [Unreleased]"
+          with open("CHANGELOG.md") as f:
+              changelog = f.read()
+          if heading not in changelog:
+              fail("CHANGELOG.md no tiene la sección '## [Unreleased]'")
+          if f"## [{new}]" in changelog:
+              fail(f"CHANGELOG.md ya tiene una sección para la versión {new}")
+          rest = changelog[changelog.index(heading) + len(heading):]
+          following = rest.find("\n## [")
+          notes = rest if following == -1 else rest[:following]
+          if not notes.strip():
+              print(f"::warning::[Unreleased] está vacía: la versión {new} no tendrá notas en el CHANGELOG")
+          today = datetime.date.today().isoformat()
+          changelog = changelog.replace(heading, f"{heading}\n\n## [{new}] - {today}", 1)
+          with open("CHANGELOG.md", "w") as f:
+              f.write(changelog)
+
+          print(f"Versión: {current} -> {new}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"NEW_VERSION={new}\n")
+          PY
+
+      - name: Validate Compilation & Tests
+        run: |
+          # `cargo check` actualiza la versión del paquete en Cargo.lock.
+          # Los tests corren aquí porque un PR creado con GITHUB_TOKEN no dispara el CI.
+          cargo check
+          cargo test --locked
+
+      - name: Commit and Push Release Branch
+        id: git_push
+        env:
+          NEW_VER: ${{ steps.bump_version.outputs.NEW_VERSION }}
+        run: |
+          BRANCH_NAME="release/v${NEW_VER}"
+
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git checkout -b "$BRANCH_NAME"
+          git add Cargo.toml Cargo.lock README.md CHANGELOG.md
+
+          if git diff --quiet --staged; then
+            echo "::error::No hay cambios para la versión ${NEW_VER}."
+            exit 1
+          fi
+
+          git commit -m "chore(release): bump version to v${NEW_VER}"
+          git push origin "$BRANCH_NAME" --force
+          echo "Pushed branch $BRANCH_NAME successfully."
+          echo "BRANCH_NAME=$BRANCH_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Create Pull Request via GitHub CLI
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEW_VER: ${{ steps.bump_version.outputs.NEW_VERSION }}
+          BRANCH_NAME: ${{ steps.git_push.outputs.BRANCH_NAME }}
+        run: |
+          # Verificar si ya existe un PR abierto para esa rama
+          EXISTING_PR=$(gh pr list --head "$BRANCH_NAME" --state open --json number -q '.[0].number')
+          if [ -n "$EXISTING_PR" ]; then
+            echo "Ya existe un Pull Request abierto (#$EXISTING_PR) para la rama $BRANCH_NAME"
+            exit 0
+          fi
+
+          BODY=$(printf '%s\n' \
+            "### Release v${NEW_VER}" \
+            "" \
+            "Pull Request creado de forma automatizada por el pipeline de release." \
+            "" \
+            "Al hacer merge en \`main\` se crea la etiqueta \`v${NEW_VER}\`, se publica \`fsm-forge ${NEW_VER}\` en crates.io y se crea el Release en GitHub." \
+            "" \
+            "Revisa la sección \`[${NEW_VER}]\` del CHANGELOG antes del merge: es el texto del Release.")
+
+          gh pr create \
+            --title "chore(release): bump version to v${NEW_VER}" \
+            --body "$BODY" \
+            --head "$BRANCH_NAME" \
+            --base main
