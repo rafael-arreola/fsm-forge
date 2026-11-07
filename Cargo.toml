@@ -1,6 +1,6 @@
 [package]
 name = "fsm-forge"
-version = "0.1.0"
+version = "0.0.0"
 edition = "2024"
 rust-version = "1.90"
 description = "A dependency-free state machine engine: edges, scoped rules, diagnostics, and build-time validation."
@@ -11,7 +11,7 @@ repository = "https://github.com/rafael-arreola/fsm-forge"
 homepage = "https://github.com/rafael-arreola/fsm-forge"
 documentation = "https://docs.rs/fsm-forge"
 readme = "README.md"
-exclude = [".github/*"]
+exclude = [".github/*", "skills/*"]
 
 [dependencies]
 

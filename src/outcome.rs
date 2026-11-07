@@ -12,6 +12,29 @@ pub struct AppliedEffect<M: Machine> {
     pub effect: M::Effect,
 }
 
+impl<M: Machine> Clone for AppliedEffect<M>
+where
+    M::Effect: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            rule: self.rule,
+            effect: self.effect.clone(),
+        }
+    }
+}
+
+impl<M: Machine> PartialEq for AppliedEffect<M>
+where
+    M::Effect: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.rule == other.rule && self.effect == other.effect
+    }
+}
+
+impl<M: Machine> Eq for AppliedEffect<M> where M::Effect: Eq {}
+
 impl<M: Machine> fmt::Debug for AppliedEffect<M>
 where
     M::Effect: fmt::Debug,
@@ -48,10 +71,35 @@ pub struct Transition<M: Machine> {
 
 impl<M: Machine> Transition<M> {
     /// `true` if origin and destination are the same state.
+    #[must_use]
     pub fn is_self_loop(&self) -> bool {
         self.from == self.to
     }
 }
+
+impl<M: Machine> Clone for Transition<M> {
+    fn clone(&self) -> Self {
+        Self {
+            event: self.event,
+            from: self.from,
+            to: self.to,
+            rules: self.rules.clone(),
+            from_any: self.from_any,
+        }
+    }
+}
+
+impl<M: Machine> PartialEq for Transition<M> {
+    fn eq(&self, other: &Self) -> bool {
+        self.event == other.event
+            && self.from == other.from
+            && self.to == other.to
+            && self.rules == other.rules
+            && self.from_any == other.from_any
+    }
+}
+
+impl<M: Machine> Eq for Transition<M> {}
 
 impl<M: Machine> fmt::Debug for Transition<M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -90,6 +138,38 @@ impl<M: Machine> Outcome<M> {
             .filter(move |applied| applied.rule == rule)
             .map(|applied| &applied.effect)
     }
+}
+
+impl<M: Machine> Clone for Outcome<M>
+where
+    M::Effect: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            transition: self.transition.clone(),
+            entity: self.entity.clone(),
+            effects: self.effects.clone(),
+        }
+    }
+}
+
+impl<M: Machine> PartialEq for Outcome<M>
+where
+    M::Entity: PartialEq,
+    M::Effect: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.transition == other.transition
+            && self.entity == other.entity
+            && self.effects == other.effects
+    }
+}
+
+impl<M: Machine> Eq for Outcome<M>
+where
+    M::Entity: Eq,
+    M::Effect: Eq,
+{
 }
 
 impl<M: Machine> fmt::Debug for Outcome<M> {

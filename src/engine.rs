@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 
 use crate::builder::EngineBuilder;
 use crate::edge::CompiledEdge;
@@ -12,12 +13,24 @@ use crate::rule::{Rule, Scope, Step};
 /// Built only by [`EngineBuilder::build`], which guarantees the invariants the indexes
 /// rely on: every index points into `edges`, and an event has at most one edge without
 /// origin.
+#[must_use]
 pub struct Engine<M: Machine> {
     pub(crate) edges: Vec<CompiledEdge<M>>,
     pub(crate) roots: Vec<M::State>,
     pub(crate) rules: Vec<(Scope<M>, Box<dyn Rule<M>>)>,
     pub(crate) by_origin: HashMap<(M::Event, M::State), usize>,
     pub(crate) by_event: HashMap<M::Event, EventIndex>,
+}
+
+impl<M: Machine> fmt::Debug for Engine<M> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let rules: Vec<&'static str> = self.rules.iter().map(|(_, rule)| rule.name()).collect();
+        f.debug_struct("Engine")
+            .field("edges", &self.edges.len())
+            .field("roots", &self.roots)
+            .field("rules", &rules)
+            .finish()
+    }
 }
 
 /// The edges of one event, as positions in `Engine::edges`.
@@ -81,6 +94,7 @@ impl<M: Machine> Engine<M> {
     /// Events with a normal transition from the current state, in declaration order.
     ///
     /// It only looks at the topology: rules are evaluated on execution.
+    #[must_use]
     pub fn available(&self, entity: &M::Entity) -> Vec<M::Event> {
         let state = M::state(entity);
         self.edges
@@ -116,6 +130,7 @@ impl<M: Machine> Engine<M> {
     ///
     /// Because guards can read `input`, the verdict is only as reliable as the `Input`
     /// you pass. It does not call `Rule::effects`.
+    #[must_use]
     pub fn available_detailed(
         &self,
         entity: &M::Entity,
@@ -130,6 +145,7 @@ impl<M: Machine> Engine<M> {
     /// Destination of `event` from `from` according to the topology.
     ///
     /// It does not evaluate rules or select a from-any edge.
+    #[must_use]
     pub fn target(&self, event: M::Event, from: M::State) -> Option<M::State> {
         self.by_origin
             .get(&(event, from))
@@ -140,11 +156,13 @@ impl<M: Machine> Engine<M> {
     ///
     /// The engine does not create entities, but this value tells the application layer
     /// in which state a new entity is born.
+    #[must_use]
     pub fn initial(&self) -> Option<M::State> {
         self.roots.first().copied()
     }
 
     /// Every declared entry state, in order.
+    #[must_use]
     pub fn roots(&self) -> &[M::State] {
         &self.roots
     }

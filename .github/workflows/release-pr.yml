@@ -34,6 +34,8 @@ jobs:
 
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - name: Bump Version in Cargo.toml, README.md & CHANGELOG.md
         id: bump_version
@@ -142,12 +144,16 @@ jobs:
               out.write(f"NEW_VERSION={new}\n")
           PY
 
-      - name: Validate Compilation & Tests
+      - name: Validate Compilation, Tests & Docs
+        env:
+          RUSTDOCFLAGS: "-D warnings"
         run: |
           # `cargo check` actualiza la versión del paquete en Cargo.lock.
-          # Los tests corren aquí porque un PR creado con GITHUB_TOKEN no dispara el CI.
+          # Las verificaciones corren aquí porque un PR creado con GITHUB_TOKEN no dispara el CI.
           cargo check
           cargo test --locked
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo doc --locked --no-deps
 
       - name: Commit and Push Release Branch
         id: git_push

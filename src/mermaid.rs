@@ -11,6 +11,7 @@ impl<M: Machine> Engine<M> {
     /// - Ids: the state's `Debug`, sanitized and disambiguated when two states collide.
     /// - Labels: `Machine::state_name` / `Machine::event_name`, escaped.
     /// - Edges without origin appear as a note on their target state.
+    #[must_use]
     pub fn to_mermaid(&self) -> String {
         // Every state in the diagram, once, in order of appearance: roots first, then
         // the edges in declaration order.

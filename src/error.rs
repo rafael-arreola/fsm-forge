@@ -6,7 +6,7 @@ use std::fmt;
 use crate::machine::Machine;
 
 /// Phase in which a rule rejected the transition.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Phase {
     /// A precondition failed (`Rule::check`).
     Check,
@@ -26,6 +26,30 @@ pub struct AppliedError<M: Machine> {
     /// The error itself.
     pub error: M::Error,
 }
+
+impl<M: Machine> Clone for AppliedError<M>
+where
+    M::Error: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            rule: self.rule,
+            phase: self.phase,
+            error: self.error.clone(),
+        }
+    }
+}
+
+impl<M: Machine> PartialEq for AppliedError<M>
+where
+    M::Error: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.rule == other.rule && self.phase == other.phase && self.error == other.error
+    }
+}
+
+impl<M: Machine> Eq for AppliedError<M> where M::Error: Eq {}
 
 impl<M: Machine> fmt::Debug for AppliedError<M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -69,6 +93,7 @@ impl<M: Machine> Rejection<M> {
     }
 
     /// The full rule errors, or `None` if the rejection did not come from rules.
+    #[must_use]
     pub fn rules(&self) -> Option<&[AppliedError<M>]> {
         match self {
             Self::Rules(errors) => Some(errors),
@@ -76,6 +101,49 @@ impl<M: Machine> Rejection<M> {
         }
     }
 }
+
+impl<M: Machine> Clone for Rejection<M>
+where
+    M::Error: Clone,
+{
+    fn clone(&self) -> Self {
+        match self {
+            Self::UnknownEvent(event) => Self::UnknownEvent(*event),
+            Self::NotAllowed { event, from } => Self::NotAllowed {
+                event: *event,
+                from: *from,
+            },
+            Self::Ambiguous(event) => Self::Ambiguous(*event),
+            Self::Rules(errors) => Self::Rules(errors.clone()),
+        }
+    }
+}
+
+impl<M: Machine> PartialEq for Rejection<M>
+where
+    M::Error: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::UnknownEvent(a), Self::UnknownEvent(b)) => a == b,
+            (
+                Self::NotAllowed {
+                    event: event_a,
+                    from: from_a,
+                },
+                Self::NotAllowed {
+                    event: event_b,
+                    from: from_b,
+                },
+            ) => event_a == event_b && from_a == from_b,
+            (Self::Ambiguous(a), Self::Ambiguous(b)) => a == b,
+            (Self::Rules(a), Self::Rules(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl<M: Machine> Eq for Rejection<M> where M::Error: Eq {}
 
 impl<M: Machine> fmt::Display for AppliedError<M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -161,6 +229,40 @@ pub enum BuildError<M: Machine> {
     UnreachableState(M::State),
 }
 
+impl<M: Machine> Clone for BuildError<M> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<M: Machine> Copy for BuildError<M> {}
+
+impl<M: Machine> PartialEq for BuildError<M> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Conflict {
+                    event: event_a,
+                    from: from_a,
+                },
+                Self::Conflict {
+                    event: event_b,
+                    from: from_b,
+                },
+            ) => event_a == event_b && from_a == from_b,
+            (Self::MissingEvent(a), Self::MissingEvent(b)) => a == b,
+            (Self::MissingState(a), Self::MissingState(b)) => a == b,
+            (Self::AmbiguousOriginless { event: a }, Self::AmbiguousOriginless { event: b }) => {
+                a == b
+            }
+            (Self::UnreachableState(a), Self::UnreachableState(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl<M: Machine> Eq for BuildError<M> {}
+
 /// All construction errors of a machine, reported together by `build()`.
 pub struct BuildErrors<M: Machine> {
     errors: Vec<BuildError<M>>,
@@ -177,24 +279,62 @@ impl<M: Machine> BuildErrors<M> {
     }
 
     /// The errors as a slice.
+    #[must_use]
     pub fn as_slice(&self) -> &[BuildError<M>] {
         &self.errors
     }
 
     /// How many errors there are.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.errors.len()
     }
 
     /// `true` if there are no errors. In practice `build()` only returns `BuildErrors`
     /// when there is at least one.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.errors.is_empty()
     }
 
     /// Consumes the container and returns the errors.
+    #[must_use]
     pub fn into_vec(self) -> Vec<BuildError<M>> {
         self.errors
+    }
+}
+
+impl<M: Machine> Clone for BuildErrors<M> {
+    fn clone(&self) -> Self {
+        Self {
+            errors: self.errors.clone(),
+        }
+    }
+}
+
+impl<M: Machine> PartialEq for BuildErrors<M> {
+    fn eq(&self, other: &Self) -> bool {
+        self.errors == other.errors
+    }
+}
+
+impl<M: Machine> Eq for BuildErrors<M> {}
+
+impl<M: Machine> IntoIterator for BuildErrors<M> {
+    type Item = BuildError<M>;
+    type IntoIter = std::vec::IntoIter<BuildError<M>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.errors.into_iter()
+    }
+}
+
+impl<'a, M: Machine> IntoIterator for &'a BuildErrors<M> {
+    type Item = &'a BuildError<M>;
+    type IntoIter = std::slice::Iter<'a, BuildError<M>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.errors.iter()
     }
 }
 

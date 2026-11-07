@@ -1,5 +1,6 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 
 use crate::edge::{CompiledEdge, Edge};
 use crate::engine::{Engine, EventIndex};
@@ -8,6 +9,7 @@ use crate::machine::Machine;
 use crate::rule::{Rule, Scope};
 
 /// A machine declaration. `build()` validates it and returns the [`Engine`].
+#[must_use]
 pub struct EngineBuilder<M: Machine> {
     edges: Vec<CompiledEdge<M>>,
     roots: Vec<M::State>,
@@ -25,6 +27,17 @@ impl<M: Machine> Default for EngineBuilder<M> {
             required: Vec::new(),
             required_states: Vec::new(),
         }
+    }
+}
+
+impl<M: Machine> fmt::Debug for EngineBuilder<M> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let rules: Vec<&'static str> = self.rules.iter().map(|(_, rule)| rule.name()).collect();
+        f.debug_struct("EngineBuilder")
+            .field("edges", &self.edges.len())
+            .field("roots", &self.roots)
+            .field("rules", &rules)
+            .finish()
     }
 }
 

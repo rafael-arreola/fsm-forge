@@ -102,8 +102,34 @@ pub struct Step<'a, M: Machine> {
 
 impl<M: Machine> Step<'_, M> {
     /// `true` when origin and destination are the same state.
+    #[must_use]
     pub fn is_self_loop(&self) -> bool {
         self.from == self.to
+    }
+}
+
+impl<M: Machine> Clone for Step<'_, M> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<M: Machine> Copy for Step<'_, M> {}
+
+impl<M: Machine> fmt::Debug for Step<'_, M>
+where
+    M::Entity: fmt::Debug,
+    M::Input: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Step")
+            .field("entity", &self.entity)
+            .field("event", &M::event_name(self.event))
+            .field("from", &M::state_name(self.from))
+            .field("to", &M::state_name(self.to))
+            .field("input", &self.input)
+            .field("from_any", &self.from_any)
+            .finish()
     }
 }
 
@@ -117,6 +143,7 @@ type EffectsFn<M> =
     dyn Fn(&Step<'_, M>, &<M as Machine>::Entity) -> Vec<<M as Machine>::Effect> + Send + Sync;
 
 /// Where a global rule applies.
+#[must_use]
 pub struct Scope<M: Machine>(ScopeKind<M>);
 
 /// The static cases avoid the boxed predicate used by [`Scope::when`].
@@ -166,9 +193,22 @@ impl<M: Machine> Scope<M> {
     }
 }
 
+impl<M: Machine> fmt::Debug for Scope<M> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            ScopeKind::Always => f.write_str("Scope::Always"),
+            ScopeKind::On(events) => f.debug_tuple("Scope::On").field(events).finish(),
+            ScopeKind::Entering(states) => f.debug_tuple("Scope::Entering").field(states).finish(),
+            ScopeKind::Leaving(states) => f.debug_tuple("Scope::Leaving").field(states).finish(),
+            ScopeKind::When(_) => f.write_str("Scope::When(..)"),
+        }
+    }
+}
+
 /// A named rule built from a closure.
 ///
 /// Constructed with [`guard`], [`mutate`], [`verify`], or [`emit`].
+#[must_use]
 pub struct NamedRule<M: Machine> {
     name: &'static str,
     kind: RuleKind<M>,
