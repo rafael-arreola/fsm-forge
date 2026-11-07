@@ -37,7 +37,7 @@ jobs:
         with:
           components: clippy
 
-      - name: Bump Version in Cargo.toml, README.md & CHANGELOG.md
+      - name: Bump Version in Cargo.toml & CHANGELOG.md
         id: bump_version
         env:
           # Los inputs llegan como variables de entorno, nunca interpolados en el código:
@@ -104,24 +104,7 @@ jobs:
           with open("Cargo.toml", "w") as f:
               f.writelines(lines)
 
-          # 2. README.md: `fsm-forge = "0.1"` conserva su precisión (mayor.menor o completa)
-          major, minor = new.split(".")[:2]
-
-
-          def dependency(match):
-              precision = match.group(1).count(".")
-              value = new if precision >= 2 else f"{major}.{minor}"
-              return f'fsm-forge = "{value}"'
-
-
-          with open("README.md") as f:
-              readme = f.read()
-          readme, count = re.subn(r'fsm-forge = "([^"]+)"', dependency, readme)
-          with open("README.md", "w") as f:
-              f.write(readme)
-          print(f"README.md: {count} referencia(s) actualizada(s)")
-
-          # 3. CHANGELOG.md: lo acumulado en [Unreleased] pasa a la nueva versión
+          # 2. CHANGELOG.md: lo acumulado en [Unreleased] pasa a la nueva versión
           heading = "## [Unreleased]"
           with open("CHANGELOG.md") as f:
               changelog = f.read()
@@ -166,7 +149,7 @@ jobs:
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git checkout -b "$BRANCH_NAME"
-          git add Cargo.toml Cargo.lock README.md CHANGELOG.md
+          git add Cargo.toml Cargo.lock CHANGELOG.md
 
           if git diff --quiet --staged; then
             echo "::error::No hay cambios para la versión ${NEW_VER}."

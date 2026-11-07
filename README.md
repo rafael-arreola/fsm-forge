@@ -17,9 +17,8 @@ application.
 
 ## Installation
 
-```toml
-[dependencies]
-fsm-forge = "0.1"
+```sh
+cargo add fsm-forge
 ```
 
 Requires Rust 1.90 or later (edition 2024) and has no dependencies.
