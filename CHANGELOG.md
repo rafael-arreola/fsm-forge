@@ -5,6 +5,8 @@ The format follows Keep a Changelog and Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-12
+
 ### Added
 
 - Inline scoped-rule methods on `EngineBuilder`: `.check`, `.apply`, `.verify`, `.effects`,
