@@ -14,6 +14,10 @@ pub trait Machine: Sized + 'static {
     type Event: Copy + Eq + Hash + Debug + Send + Sync + 'static;
 
     /// The entity whose state changes. The engine clones it and returns the modified copy.
+    ///
+    /// `Clone` must produce an independent value (no shared interior mutability with the
+    /// original entity), so rejected transitions and [`Engine::diagnose`](crate::Engine::diagnose)
+    /// leave the caller's entity untouched.
     type Entity: Clone;
 
     /// Data carried by the event: payload, actor, metadata.
@@ -27,7 +31,7 @@ pub trait Machine: Sized + 'static {
     /// Why a rule rejects a transition.
     ///
     /// It is shown to the end user, so it must be readable, not an internal code.
-    type Error: Display + Send + Sync + 'static;
+    type Error: Debug + Display + Send + Sync + 'static;
 
     /// Reads the entity's current state.
     fn state(entity: &Self::Entity) -> Self::State;

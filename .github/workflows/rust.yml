@@ -6,18 +6,38 @@ on:
   pull_request:
     branches: ["main"]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   test:
-    name: Test Suite
+    name: Test Suite & Examples
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-      - name: Run tests (unit, integration, examples, and doc tests)
+      - name: Run unit, integration, and doc tests
+        run: cargo test --locked --verbose
+      - name: Run runnable examples
+        run: |
+          for example in 01_minimal 02_phases 03_counter 04_scopes 05_diagnostics 06_from_any 07_topology 08_ticket; do
+            cargo run --locked --quiet --example "$example" >/dev/null
+          done
+      - name: Verify crate packaging
+        run: cargo package --locked
+
+  msrv:
+    name: MSRV (1.90)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust 1.90
+        uses: dtolnay/rust-toolchain@1.90
+      - name: Run tests on MSRV
         run: cargo test --locked --verbose
 
   fmt:

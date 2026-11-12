@@ -64,8 +64,8 @@ pub struct Transition<M: Machine> {
     /// Rules that took part, in execution order: the edge first, then the scoped rules.
     pub rules: Vec<&'static str>,
 
-    /// `true` if it ran (or was diagnosed) ignoring the origin state, through
-    /// `execute_from_any` or `diagnose_from_any`.
+    /// `true` if it ran (or was diagnosed) through `execute_from_any` or
+    /// `diagnose_from_any`.
     pub from_any: bool,
 }
 
@@ -104,9 +104,9 @@ impl<M: Machine> Eq for Transition<M> {}
 impl<M: Machine> fmt::Debug for Transition<M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Transition")
-            .field("event", &M::event_name(self.event))
-            .field("from", &M::state_name(self.from))
-            .field("to", &M::state_name(self.to))
+            .field("event", &self.event)
+            .field("from", &self.from)
+            .field("to", &self.to)
             .field("rules", &self.rules)
             .field("from_any", &self.from_any)
             .finish()
@@ -114,6 +114,7 @@ impl<M: Machine> fmt::Debug for Transition<M> {
 }
 
 /// Result of an accepted transition.
+#[must_use = "an Outcome holds the updated entity and effects; ignoring it leaves your entity unchanged"]
 pub struct Outcome<M: Machine> {
     /// What ran: event, origin, destination, rules, and mode.
     pub transition: Transition<M>,
@@ -129,14 +130,6 @@ impl<M: Machine> Outcome<M> {
     /// The effects without the rule that produced them.
     pub fn effect_values(&self) -> impl Iterator<Item = &M::Effect> {
         self.effects.iter().map(|applied| &applied.effect)
-    }
-
-    /// The effects produced by a specific rule.
-    pub fn effects_of(&self, rule: &'static str) -> impl Iterator<Item = &M::Effect> {
-        self.effects
-            .iter()
-            .filter(move |applied| applied.rule == rule)
-            .map(|applied| &applied.effect)
     }
 }
 
@@ -172,11 +165,16 @@ where
 {
 }
 
-impl<M: Machine> fmt::Debug for Outcome<M> {
+impl<M: Machine> fmt::Debug for Outcome<M>
+where
+    M::Entity: fmt::Debug,
+    M::Effect: fmt::Debug,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Outcome")
             .field("transition", &self.transition)
-            .field("effects", &self.effects.len())
+            .field("entity", &self.entity)
+            .field("effects", &self.effects)
             .finish()
     }
 }

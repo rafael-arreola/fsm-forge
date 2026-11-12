@@ -25,17 +25,18 @@ Requires Rust 1.90 or later (edition 2024) and has no dependencies.
 
 ## Minimal example
 
-The snippets in this README are illustrative. The runnable examples are
-`examples/minimal/` (smallest) and `examples/ticket/` (largest):
+The snippets in this README are illustrative. The runnable examples walk step by step
+from `examples/01_minimal/` (smallest) to `examples/08_ticket/` (largest):
 
 ```sh
-cargo run --example invoice
-cargo run --example ticket
-cargo run --example ticket -- --mermaid
+cargo run --example 01_minimal
+cargo run --example 03_counter
+cargo run --example 08_ticket
+cargo run --example 08_ticket -- --mermaid
 ```
 
 ```rust
-use fsm_forge::{Edge, Engine, Machine, Rule, Scope, Step, emit};
+use fsm_forge::{Edge, Engine, Machine, Scope, Step};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Status { Draft, Issued }
@@ -66,9 +67,7 @@ impl Edge<InvoiceMachine> for Issue {
     const EVENT: Event = Event::Issue;
     const FROM: &'static [Status] = &[Status::Draft];
     const TO: Status = Status::Issued;
-}
 
-impl Rule<InvoiceMachine> for Issue {
     fn check(&self, step: &Step<'_, InvoiceMachine>) -> Result<(), String> {
         if step.entity.total > 0 { Ok(()) } else { Err("total must be positive".into()) }
     }
@@ -77,15 +76,16 @@ impl Rule<InvoiceMachine> for Issue {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let engine = Engine::<InvoiceMachine>::builder()
         .edge(Issue)
-        .rule(Scope::always(), emit("audit", "audit"))
+        .emit(Scope::always(), "audit", "audit")
         .require_events([Event::Issue])
         .require_states([Status::Draft, Status::Issued])
         .build()?;
 
-    let invoice = Invoice { status: Status::Draft, total: 100 };
+    let mut invoice = Invoice { status: Status::Draft, total: 100 };
     let outcome = engine.execute(&invoice, Event::Issue, &100)?;
+    invoice = outcome.entity;
 
-    assert_eq!(outcome.transition.to, Status::Issued);
+    assert_eq!(invoice.status, Status::Issued);
     Ok(())
 }
 ```
@@ -101,15 +101,15 @@ persists the result and runs the effects itself:
 flowchart LR
     subgraph domain["Your domain"]
         M["Machine<br/>State, Event, Entity,<br/>Input, Effect, Error"]
-        E["Edge types<br/>impl Edge: EVENT, FROM, TO<br/>impl Rule: the logic"]
-        R["Scoped rules<br/>impl Rule, or guard, mutate,<br/>verify, emit"]
+        E["Edge types<br/>impl Edge: EVENT, FROM, TO,<br/>and optional phases"]
+        R["Scoped rules<br/>impl Rule, or builder<br/>.check/.apply/.verify/.effects/.emit"]
         S["Scope<br/>always, on, entering,<br/>leaving, when"]
     end
 
     subgraph buildtime["Build time: once, at startup"]
-        B["EngineBuilder<br/>.edge, .rule, .initial, .roots,<br/>.require_events, .require_states"]
+        B["EngineBuilder<br/>.edge, .rule, .check, .apply, .verify,<br/>.effects, .emit, .initial, .roots,<br/>.require_events, .require_states"]
         V{"build()"}
-        BE["BuildErrors<br/>Conflict, AmbiguousOriginless,<br/>MissingEvent, MissingState,<br/>UnreachableState"]
+        BE["BuildErrors<br/>Conflict, AmbiguousOriginless,<br/>ShadowedOriginless, MissingEvent,<br/>MissingState, UnreachableState"]
         EN["Engine<br/>immutable and reusable"]
     end
 
@@ -122,16 +122,16 @@ flowchart LR
     M -.->|"fixes the types"| B
     E -->|".edge(...)"| B
     S -->|"decides where"| R
-    R -->|".rule(scope, ...)"| B
+    R -->|".rule / .check / .emit"| B
     B --> V
     V -->|"Err: all errors together"| BE
     V -->|"Ok"| EN
 
     APP -->|"execute, execute_from_any"| EN
     EN -->|"Outcome: transition, entity, effects<br/>or Rejection"| APP
-    APP -->|"diagnose, available_detailed"| EN
-    EN -->|"Verdict: Transition or Rejection"| APP
-    APP -->|"target, initial, roots, to_mermaid"| EN
+    APP -->|"diagnose, diagnose_from_any, available_detailed"| EN
+    EN -->|"Verdict (or Vec per event)"| APP
+    APP -->|"available, target, initial, roots, to_mermaid"| EN
     APP -->|"first: save outcome.entity"| DB
     APP -->|"then: run the effects"| EXT
 ```
@@ -143,9 +143,8 @@ returns a new one plus a description of the work to do.
 
 ### Edges
 
-An edge is a type: one type per transition. It implements two traits: `Edge`, with the
-topology as constants, and `Rule`, with the logic as methods. Nothing is hidden in a
-builder chain.
+An edge is a type: one type per transition. It implements `Edge`, with the topology as
+constants and the logic as optional methods. Nothing is hidden in a builder chain.
 
 ```rust
 struct Issue;
@@ -154,9 +153,7 @@ impl Edge<InvoiceMachine> for Issue {
     const EVENT: Event = Event::Issue;
     const FROM: &'static [Status] = &[Status::Draft];
     const TO: Status = Status::Issued;
-}
 
-impl Rule<InvoiceMachine> for Issue {
     fn check(&self, step: &Step<'_, InvoiceMachine>) -> Result<(), String> { /* ... */ }
     fn apply(&self, step: &Step<'_, InvoiceMachine>, invoice: &mut Invoice) { /* ... */ }
     fn verify(&self, step: &Step<'_, InvoiceMachine>, invoice: &Invoice) -> Result<(), String> { /* ... */ }
@@ -167,36 +164,32 @@ impl Rule<InvoiceMachine> for Issue {
 Register it with `.edge(Issue)`. The constants describe the graph and the methods describe
 the work:
 
-| Piece     | Trait  | Meaning                                                                        |
-| --------- | ------ | ------------------------------------------------------------------------------ |
-| `EVENT`   | `Edge` | The event that triggers the edge.                                              |
-| `FROM`    | `Edge` | Origin states. `&[]` makes the edge reachable only through `execute_from_any`. |
-| `TO`      | `Edge` | Destination state.                                                             |
-| `check`   | `Rule` | Precondition; `Err` rejects the transition.                                    |
-| `apply`   | `Rule` | Change to the entity; the engine runs it on a copy.                            |
-| `verify`  | `Rule` | Post-condition over the modified entity and the destination state.             |
-| `effects` | `Rule` | Work the caller must run after persisting.                                     |
-| `name`    | `Rule` | Label in diagnostics; defaults to the type name.                               |
+| Piece     | Kind     | Meaning                                                                        |
+| --------- | -------- | ------------------------------------------------------------------------------ |
+| `EVENT`   | constant | The event that triggers the edge.                                              |
+| `FROM`    | constant | Origin states. `&[]` makes the edge reachable only through `execute_from_any`. |
+| `TO`      | constant | Destination state.                                                             |
+| `check`   | method   | Precondition; `Err` rejects the transition.                                    |
+| `apply`   | method   | Change to the entity; the engine runs it on a copy.                            |
+| `verify`  | method   | Post-condition over the modified entity and the destination state.             |
+| `effects` | method   | Work the caller must run after persisting.                                     |
+| `name`    | method   | Label in diagnostics; defaults to the type name.                               |
 
-Every `Rule` method is optional. An edge without logic still implements `Rule`, with an
-empty block:
+Every phase method is optional. An edge without logic only declares the three constants:
 
 ```rust
-impl Rule<InvoiceMachine> for Archive {}
+struct Archive;
+
+impl Edge<InvoiceMachine> for Archive {
+    const EVENT: Event = Event::Archive;
+    const FROM: &'static [Status] = &[Status::Issued];
+    const TO: Status = Status::Archived;
+}
 ```
 
-> **Register an edge with `.edge(...)`, never with `.rule(...)`.** Because an edge is a
-> `Rule`, the compiler accepts it in both places, and `build()` does not report it either.
-> In `.rule(scope, ...)` its logic runs on every transition the scope selects:
->
-> ```rust
-> .edge(SolutionConfirmed)                    // correct: only Resolved -> Closed
-> .rule(Scope::always(), SolutionConfirmed)   // wrong: runs on every transition
-> ```
->
-> Its `check` would reject unrelated transitions, its `apply` would modify the entity on
-> each of them, and its `effects` would be emitted everywhere. An `apply`-only edge is
-> the hardest case to notice, because nothing fails.
+`Edge` and `Rule` are separate traits: `.edge(...)` only accepts `Edge` types and
+`.rule(scope, ...)` only accepts `Rule` types, so an edge can never be registered as a
+global rule by mistake.
 
 - An event can have **several edges** if they leave from different states.
 - The same `(event, origin)` **cannot** have two targets: `build()` reports it as
@@ -215,11 +208,9 @@ struct InactivityTimeout {
 
 impl Edge<TicketMachine> for InactivityTimeout {
     // EVENT, FROM, TO
-}
 
-impl Rule<TicketMachine> for InactivityTimeout {
     fn check(&self, step: &Step<'_, TicketMachine>) -> Result<(), &'static str> {
-        expect(step.input.inactive_hours >= self.hours, "too early")
+        if step.input.inactive_hours >= self.hours { Ok(()) } else { Err("too early") }
     }
 }
 
@@ -236,8 +227,8 @@ The engine does not create entities. Declare the states they are born in:
 ```
 
 ```rust
-engine.initial(); // Option<State>: the first root
-engine.roots();   // &[State]
+let initial = engine.initial(); // Option<State>: the primary root
+let roots = engine.roots();     // &[State]
 ```
 
 This is **metadata**: it does not affect `execute`, `available`, or edge selection.
@@ -258,25 +249,24 @@ What it **does not** do:
   guarantee.
 
 Reachability validation only runs when roots are declared; without them,
-"reachable" would have no definition. An edge without origin counts for reachability,
-because `execute_from_any` can reach its target from any state. A root that appears in no
-edge is valid.
+"reachable" would have no definition. An edge without origin counts for reachability as
+long as at least one reachable state has no explicit edge for that event (otherwise
+`build()` reports `ShadowedOriginless`). A root that appears in no edge is valid.
 
 If you need runtime behavior ("this may only run from the initial state"), that is a
 domain rule with `check`, not an engine property.
 
 ### Rules
 
-A `Rule` is logic without topology, and it runs in two places. Implemented on an `Edge`
-type, it runs for that transition only. Registered with a `Scope`, it runs for every
-transition the scope selects. Both go through the same pipeline; the engine runs the
-edge's rule first, then every matching scoped rule in registration order.
+A `Rule` is logic without topology, registered with a `Scope` so it runs for every
+transition the scope selects. It exposes the exact same optional phases as `Edge`; the
+engine runs the edge first, then every matching scoped rule in registration order.
 
-| If the logic...                                               | Put it in                          |
-| ------------------------------------------------------------- | ---------------------------------- |
-| depends on the specific event, origin, or destination         | the `Rule` impl of the `Edge` type |
-| applies to many transitions by event, state, or from-any mode | a standalone `Rule` + `Scope`      |
-| describes work the caller must run after saving               | `effects`, in either of them       |
+| If the logic...                                               | Put it in                     |
+| ------------------------------------------------------------- | ----------------------------- |
+| depends on the specific event, origin, or destination         | the `Edge` impl               |
+| applies to many transitions by event, state, or from-any mode | a standalone `Rule` + `Scope` |
+| describes work the caller must run after saving               | `effects`, in either of them  |
 
 A `Rule` implements the methods it needs; all of them are optional:
 
@@ -290,16 +280,23 @@ A `Rule` implements the methods it needs; all of them are optional:
 `Step` is the context: `entity` (before the change), `event`, `from`, `to`, `input`, and
 `from_any`. It includes `is_self_loop()`.
 
+For single-phase global rules you do not need a struct: `EngineBuilder` registers closures
+directly with `.check(scope, name, ...)`, `.apply(scope, name, ...)`,
+`.verify(scope, name, ...)`, `.effects(scope, name, ...)`, and `.emit(scope, name, effect)`.
+Because the builder already carries `M`, closures infer `step.entity`, `step.input`, and
+`next` without type annotations.
+
 ### Scopes
 
-To avoid repeating a rule on every edge, register it once with a scope:
+To avoid repeating a rule on every edge, register a `Rule` type with `.rule(scope, ...)` or
+an inline phase method on `EngineBuilder`:
 
 ```rust
-.rule(Scope::always(), PublishUpdate)
-.rule(Scope::on(&[Event::Issue]), RequireNotes)
+.emit(Scope::always(), "publish_update", Effect::PublishUpdate)
+.check(Scope::on(&[Event::Issue]), "require_notes", |step| { /* ... */ })
 .rule(Scope::entering(&[Status::Issued]), SendInvoice)
 .rule(Scope::leaving(&[Status::Issued]), CloseReceivable)
-.rule(Scope::when(|step| step.from_any), OverrideAudit)
+.emit(Scope::when(|step| step.from_any), "override_audit", Effect::AuditOverride)
 ```
 
 `entering` and `leaving` **exclude self-transitions**. If a rule must run on every
@@ -355,8 +352,8 @@ impl Rule<ShipmentMachine> for RequireDriverId {
 
 1. **Select the edge** for the event from the current state, or the from-any candidate
    when `execute_from_any` is used.
-2. **Collect the rules**: first the edge's own logic (the `Rule` implemented on the
-   edge type), then the global ones whose scope applies, in registration order.
+2. **Collect the rules**: first the edge's own logic, then the global rules whose scope
+   applies, in registration order.
 3. **Run every `check`**. If any fails, reject with **all** errors together.
 4. **Clone the entity**, run every `apply` in order, and move the state.
 5. **Run every `verify`** on the resulting entity. If any fails, everything is discarded
@@ -432,29 +429,29 @@ pub struct Transition<M: Machine> {
 inside the `Outcome`, and `diagnose` returns it alone (see
 [Querying without executing](#querying-without-executing)).
 
-`effect_values()` returns only the effects, without the rule that produced them, and
-`effects_of("name")` filters by rule. `outcome.transition.is_self_loop()` compares origin
-and target.
-
-To keep the entity in your variable, move it: `entity = outcome.entity;`. The other
-fields stay readable afterwards, but methods such as `effect_values()` borrow the whole
-`Outcome`, which is now partially moved, so call them before moving the entity:
+Because `Outcome` has public fields and no `Drop` implementation, Rust lets you move each
+field independently in the natural order—save `outcome.entity` first, then consume
+`outcome.effects` by value—without cloning or declaring `mut outcome`:
 
 ```rust
 let outcome = engine.execute(&invoice, Event::Issue, &100)?;
-let effects: Vec<_> = outcome.effect_values().copied().collect(); // methods: before
-invoice = outcome.entity;                                         // moves only the entity
-let to = outcome.transition.to;                                   // fields: still readable
-// outcome.effect_values()  // error[E0382]: borrow of partially moved value
+invoice = outcome.entity;              // moves only the entity
+for applied in outcome.effects {       // moves effects by value afterwards
+    dispatch(applied.effect);
+}
+let to = outcome.transition.to;        // Copy fields stay readable
 ```
 
-If you prefer to keep the whole `Outcome` intact, clone the entity explicitly with
-`entity = outcome.entity.clone()`; the cost stays visible at the call site.
+For quick inspection by reference (before moving fields), `outcome.effect_values()` yields
+`&M::Effect` without the rule name, and `outcome.transition.is_self_loop()` compares origin
+and target. If you prefer to keep the whole `Outcome` intact, clone the entity explicitly
+with `entity = outcome.entity.clone()`; the cost stays visible at the call site.
 
 ## From-any mode
 
-`execute_from_any(&entity, event, &input)` ignores the origin state, but it **runs all
-rules**, including `check`. Edge selection follows these rules:
+`execute_from_any(&entity, event, &input)` bypasses the origin-state requirement when no
+edge starts at the current state, while still **running all rules**, including `check`.
+Edge selection follows these rules:
 
 - If the event has an edge from the current state, that one is used.
 - Otherwise, an **edge without origin** for the event is used ("from any state"). More
@@ -482,9 +479,13 @@ An edge with `FROM: &[]` is only reachable this way: `execute` never selects it.
 every rule still runs, the edge can reject a from-any execution explicitly:
 
 ```rust
-impl Rule<TicketMachine> for SolutionConfirmed {
+impl Edge<TicketMachine> for SolutionConfirmed {
+    const EVENT: TicketEvent = TicketEvent::SolutionConfirmed;
+    const FROM: &'static [TicketStatus] = &[TicketStatus::Resolved];
+    const TO: TicketStatus = TicketStatus::Closed;
+
     fn check(&self, step: &Step<'_, TicketMachine>) -> Result<(), &'static str> {
-        expect(!step.from_any, "this transition cannot be overridden")
+        if !step.from_any { Ok(()) } else { Err("this transition cannot be overridden") }
     }
 }
 ```
@@ -514,23 +515,25 @@ pub type Verdict<M> = Result<Transition<M>, Rejection<M>>;
 ## Reading the topology
 
 ```rust
-engine.target(Event::Issue, Status::Draft); // -> Option<Status>
+let next = engine.target(Event::Issue, Status::Draft); // -> Option<Status>
+let open = engine.available(&invoice);                 // -> &[Event]
 ```
 
-`target` answers where an event goes from a given state according to the declaration,
+`target` answers where an event goes from a given state according to the declaration, and
+`available` lists the events leaving the entity's current state in declaration order,
 without evaluating rules. Edges without origin have no `target`; they only run through
-`execute_from_any`.
+`execute_from_any` / `diagnose_from_any`.
 
 ## Errors
 
 ### At execution: `Rejection<M>`
 
-| Variant                       | When                                                                              |
-| ----------------------------- | --------------------------------------------------------------------------------- |
-| `UnknownEvent(event)`         | The event has no declared edges                                                   |
-| `NotAllowed { event, from }`  | The event has edges, but none starts at the current state                         |
-| `Ambiguous(event)`            | When overriding, the event has several edges and none starts at the current state |
-| `Rules(Vec<AppliedError<M>>)` | One or more rules rejected; each error carries its rule and phase                 |
+| Variant                       | When                                                                                                     |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `UnknownEvent(event)`         | The event has no declared edges                                                                          |
+| `NotAllowed { event, from }`  | The event has edges, but none starts at the current state                                                |
+| `Ambiguous(event)`            | When overriding, the event has several edges, none starts at the current state, and none has `FROM: &[]` |
+| `Rules(Vec<AppliedError<M>>)` | One or more rules rejected; each error carries its rule and phase                                        |
 
 Each `AppliedError` includes:
 
@@ -559,13 +562,14 @@ arm.
 
 `build()` accumulates **all** errors and returns them together:
 
-| Variant                         | When                                                             |
-| ------------------------------- | ---------------------------------------------------------------- |
-| `Conflict { event, from }`      | Two edges for the same event leave the same state                |
-| `MissingEvent(event)`           | An event in `require_events` has no edge                         |
-| `MissingState(state)`           | A state in `require_states` appears in no edge and is not a root |
-| `AmbiguousOriginless { event }` | More than one edge without origin for the same event             |
-| `UnreachableState(state)`       | With roots declared, the state is not reachable from any of them |
+| Variant                      | When                                                                                  |
+| ---------------------------- | ------------------------------------------------------------------------------------- |
+| `Conflict { event, from }`   | Two edges for the same event leave the same state                                     |
+| `MissingEvent(event)`        | An event in `require_events` has no edge                                              |
+| `MissingState(state)`        | A state in `require_states` appears in no edge and is not a root                      |
+| `AmbiguousOriginless(event)` | More than one edge without origin for the same event                                  |
+| `ShadowedOriginless(event)`  | An edge without origin is shadowed in every reachable state and can never be selected |
+| `UnreachableState(state)`    | With roots declared, the state is not reachable from any of them                      |
 
 ## Diagram
 
@@ -573,8 +577,9 @@ arm.
 let mermaid = engine.to_mermaid(); // stateDiagram-v2
 ```
 
-The ids are the state's `Debug`; the labels come from `Machine::state_name` and
-`Machine::event_name`. Edges without origin appear as a note on their target state.
+The ids are sanitized from the state's `Debug` (disambiguated on collisions or reserved
+keywords); the labels come from `Machine::state_name` and `Machine::event_name`. Edges
+without origin appear as a note on their target state.
 
 ## Guarantees
 
@@ -588,63 +593,69 @@ The ids are the state's `Debug`; the labels come from `Machine::state_name` and
 
 ## Examples
 
-The examples are ordered by difficulty. Each one is a directory with the same shape:
+The examples are numbered incrementally (`01_` to `08_`), introducing one capability at a
+time. Each one is a directory with the same shape:
 
 ```text
-examples/ticket/
+examples/08_ticket/
   main.rs        entry point and application layer
   machine.rs     domain types, Machine impl, and engine assembly
   edges/         one file per transition
 ```
 
-| Example      | Difficulty | One idea                                                                   |
-| ------------ | ---------- | -------------------------------------------------------------------------- |
-| `minimal`    | 1          | One edge, one event, execute and keep the result.                          |
-| `invoice`    | 2          | Application layer: preload, execute, persist, dispatch.                    |
-| `initial`    | 3          | Topology: entry points, roots, and reachability errors.                    |
-| `conditions` | 4          | `check` / `apply` / `verify`, rejection, `diagnose`, `available_detailed`. |
-| `ticket`     | 5          | Full lifecycle with 14 edges, scopes, effects, and a from-any execution.   |
+| Example          | Step | One idea                                                                                       |
+| ---------------- | ---- | ---------------------------------------------------------------------------------------------- |
+| `01_minimal`     | 1    | One `Machine`, one `Edge` (`Idle -> Running`), `execute`, and keeping `outcome.entity`.        |
+| `02_phases`      | 2    | `Input` and the four phases (`check`, `apply`, `verify`, `effects`) + persist & dispatch.      |
+| `03_counter`     | 3    | `Start -> Middle -> End` with a self-loop (`Increment`) and a scoped `>= 10` check.            |
+| `04_scopes`      | 4    | Reusable `Rule` structs and all five `Scope`s (`always`, `on`, `entering`, `leaving`, `when`). |
+| `05_diagnostics` | 5    | Querying without executing: `available`, `target`, `diagnose`, and `available_detailed`.       |
+| `06_from_any`    | 6    | `execute_from_any`, originless edges (`FROM: &[]`), blocking overrides, and override audit.    |
+| `07_topology`    | 7    | Build-time validation (`roots`, `initial`, `BuildErrors`) and `to_mermaid()`.                  |
+| `08_ticket`      | 8    | Full support-ticket lifecycle with configurable edges, scopes, effects, and overrides.         |
 
 ```sh
-cargo run --example minimal
-cargo run --example invoice
-cargo run --example initial
-cargo run --example conditions
-cargo run --example ticket
-cargo run --example ticket -- --mermaid
+cargo run --example 01_minimal
+cargo run --example 02_phases
+cargo run --example 03_counter
+cargo run --example 04_scopes
+cargo run --example 05_diagnostics
+cargo run --example 06_from_any
+cargo run --example 07_topology
+cargo run --example 08_ticket
+cargo run --example 08_ticket -- --mermaid
 ```
 
-The `initial` example builds several engines inside `main.rs` on purpose: it
-demonstrates the entry points and the build errors, not a single lifecycle.
+`07_topology` also builds an intentionally broken engine inside `main.rs` to show how
+`build()` reports every structural error together.
 
 ## Tests
 
 The integration suite covers the engine from the simplest topology to the full ticket
 lifecycle:
 
-| File               | Coverage                                                                                                  |
-| ------------------ | --------------------------------------------------------------------------------------------------------- |
-| `tests/basic.rs`   | Door and traffic light: simple edges, self-loops, several origins, from-any mode, Mermaid.                |
-| `tests/rules.rs`   | Invoice: checks, mutations, verify failures, effects, phases, `diagnose` without effects, outcome result. |
-| `tests/scopes.rs`  | Article: all five `Scope`s, self-loop boundaries, from-any scope, registration order.                     |
-| `tests/builder.rs` | Shipment: conflicts, missing events and states, ambiguous edges without origin, reachability, roots.      |
-| `tests/ticket.rs`  | Full support-ticket lifecycle: creation, assignment, waiting, reopen, timeout, supervisor override.       |
+| File               | Coverage                                                                                                            |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------- |
+| `tests/basic.rs`   | Door and traffic light: simple edges, self-loops, several origins, from-any mode, custom labels, Mermaid.           |
+| `tests/rules.rs`   | Invoice: edge phases, `Rule` structs, builder closure methods (`.check`/`.apply`/`.verify`/`.effects`), `diagnose`. |
+| `tests/scopes.rs`  | Article: all five `Scope`s, self-loop boundaries, from-any scope, registration order.                               |
+| `tests/builder.rs` | Shipment: conflicts, missing events/states, ambiguous and shadowed originless edges, reachability, roots.           |
+| `tests/ticket.rs`  | Full support-ticket lifecycle: creation, assignment, waiting, reopen, timeout, supervisor override.                 |
 
 Run them with `cargo test`.
 
 ## Crate map
 
-The `prelude` gathers the types (`Engine`, `Machine`, `Edge`, `Rejection`, ...).
-The helpers are imported from the crate root: `use fsm_forge::{guard, mutate, verify, emit};`.
+All public types are exported at the crate root (`use fsm_forge::{Engine, Machine, Edge, ...};`).
 
 | File             | Contents                                              |
 | ---------------- | ----------------------------------------------------- |
-| `src/lib.rs`     | Public surface, crate docs, and `prelude`             |
+| `src/lib.rs`     | Public surface and crate docs                         |
 | `src/machine.rs` | `Machine`: the domain contract                        |
-| `src/rule.rs`    | `Rule`, `Step`, `Scope`, `NamedRule`: logic and scope |
+| `src/rule.rs`    | `Rule`, `Step`, `Scope`: shared logic and scope       |
 | `src/edge.rs`    | `Edge` trait and the compiled edge used by the engine |
 | `src/engine.rs`  | `Engine`: execute, diagnose, and query                |
-| `src/builder.rs` | `EngineBuilder`: declare and validate                 |
+| `src/builder.rs` | `EngineBuilder`: declare, attach rules, and validate  |
 | `src/outcome.rs` | `Outcome`, `Transition`, `AppliedEffect`, `Verdict`   |
 | `src/error.rs`   | `Rejection`, `BuildError`, `BuildErrors`: what failed |
 | `src/mermaid.rs` | `to_mermaid`: the diagram                             |
@@ -652,6 +663,7 @@ The helpers are imported from the crate root: `use fsm_forge::{guard, mutate, ve
 ## Running the checks
 
 ```sh
+cargo fmt --all -- --check
 cargo test
 cargo clippy --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps

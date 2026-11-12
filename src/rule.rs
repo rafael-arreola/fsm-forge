@@ -1,42 +1,38 @@
-//! The logic of a transition: [`Rule`], and where it runs.
+//! Shared transition logic: [`Rule`], [`Scope`], and [`Step`].
 //!
-//! A [`Rule`] is logic without topology. It runs in two places:
+//! A [`Rule`] is logic without topology, registered with a [`Scope`] so it runs on every
+//! transition the scope selects. An [`Edge`](crate::Edge) declares the same optional phases
+//! (`check`, `apply`, `verify`, `effects`) for one fixed transition.
 //!
-//! - on an [`Edge`](crate::Edge) type, for that transition only: the edge's constants fix
-//!   its event, origins, and destination;
-//! - registered with a [`Scope`], for every transition the scope selects.
-//!
-//! [`Step`] is the context it receives. The engine runs the edge's rule first, then every
-//! matching scoped rule in registration order, and merges their phases: `check`, `apply`,
-//! `verify`, `effects`.
+//! [`Step`] is the read-only context both receive. The engine runs the edge first, then
+//! every matching scoped rule in registration order, merging their phases.
 //!
 //! Use a scoped rule when the same logic applies to many transitions:
 //!
 //! - an effect that must run on every transition, or whenever entering a state;
-//! - a precondition shared by several events, such as `retroactive` or "the record is
-//!   locked";
+//! - a precondition shared by several events or target states;
 //! - an audit field updated on every accepted transition.
 //!
-//! If the logic depends on the specific event or on a concrete origin/destination, put it
-//! in the [`Edge`](crate::Edge) instead.
-//!
-//! For the common case you do not need to implement the trait: [`guard`], [`mutate`],
-//! [`verify`], and [`emit`] build named rules from closures.
+//! For inline closures you do not need to implement [`Rule`]: use
+//! [`EngineBuilder::check`](crate::EngineBuilder::check),
+//! [`EngineBuilder::apply`](crate::EngineBuilder::apply),
+//! [`EngineBuilder::verify`](crate::EngineBuilder::verify),
+//! [`EngineBuilder::effects`](crate::EngineBuilder::effects), or
+//! [`EngineBuilder::emit`](crate::EngineBuilder::emit).
 
 use std::fmt;
 
 use crate::machine::Machine;
 
-/// The logic of a transition. Every method is optional.
+/// The logic of a global rule registered with a [`Scope`]. Every method is optional.
 ///
-/// An [`Edge`](crate::Edge) is a `Rule` with fixed topology: the edge type implements this
-/// trait for its own logic. Registered with a [`Scope`], the same trait describes logic
-/// shared by many transitions. Both run through the same phases.
+/// An [`Edge`](crate::Edge) defines the same four phases for a single transition; `Rule`
+/// defines them once for every transition its [`Scope`] selects. Both run through the same
+/// pipeline: the edge first, then the matching scoped rules in registration order.
 ///
-/// A type that implements [`Edge`](crate::Edge) is registered with
-/// [`EngineBuilder::edge`](crate::EngineBuilder::edge), never with
-/// [`EngineBuilder::rule`](crate::EngineBuilder::rule): see the warning on
-/// [`Edge`](crate::Edge).
+/// Implementations must be observationally pure across `check`, `apply`, and `verify` so
+/// [`Engine::diagnose`](crate::Engine::diagnose) agrees with
+/// [`Engine::execute`](crate::Engine::execute).
 pub trait Rule<M: Machine>: Send + Sync + 'static {
     /// Precondition. `Err` rejects the transition; the errors of all rules are collected.
     fn check(&self, _step: &Step<'_, M>) -> Result<(), M::Error> {
@@ -66,17 +62,41 @@ pub trait Rule<M: Machine>: Send + Sync + 'static {
     }
 }
 
-/// The type name without module path or generic arguments: `app::Audit<app::Invoice>`
-/// becomes `Audit`.
+/// The type name without module path or trailing generic arguments:
+/// `app::Outer<u8>::Audit<app::Invoice>` becomes `Audit`.
 pub(crate) fn short_type_name<T: ?Sized>() -> &'static str {
     let full = std::any::type_name::<T>();
-    // The generics go first: their arguments carry module paths of their own, so cutting
-    // at the last `::` first would keep the argument (`Invoice>`) instead of the type.
-    let without_generics = full.split('<').next().unwrap_or(full);
-    without_generics
-        .rsplit("::")
-        .next()
-        .unwrap_or(without_generics)
+    if full.starts_with(['(', '[', '&', '*', '!'])
+        || full.starts_with("dyn ")
+        || full.starts_with("fn(")
+        || full.starts_with("unsafe ")
+        || full.starts_with("extern ")
+        || full.starts_with("for<")
+    {
+        return full;
+    }
+
+    let bytes = full.as_bytes();
+    let mut end = bytes.len();
+    if bytes.last() == Some(&b'>') {
+        let mut depth = 0usize;
+        while end > 0 {
+            end -= 1;
+            match bytes[end] {
+                b'>' if end == 0 || bytes[end - 1] != b'-' => depth += 1,
+                b'<' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let name = full[..end].rsplit("::").next().unwrap_or("");
+    if name.is_empty() { full } else { name }
 }
 
 /// The execution in progress: everything a rule or a scope can see.
@@ -96,7 +116,8 @@ pub struct Step<'a, M: Machine> {
     /// Data that arrived with the event.
     pub input: &'a M::Input,
 
-    /// `true` when the transition runs through `Engine::execute_from_any`.
+    /// `true` when the transition runs through `Engine::execute_from_any` or
+    /// `Engine::diagnose_from_any`.
     pub from_any: bool,
 }
 
@@ -124,9 +145,9 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Step")
             .field("entity", &self.entity)
-            .field("event", &M::event_name(self.event))
-            .field("from", &M::state_name(self.from))
-            .field("to", &M::state_name(self.to))
+            .field("event", &self.event)
+            .field("from", &self.from)
+            .field("to", &self.to)
             .field("input", &self.input)
             .field("from_any", &self.from_any)
             .finish()
@@ -134,13 +155,6 @@ where
 }
 
 type Predicate<M> = dyn Fn(&Step<'_, M>) -> bool + Send + Sync;
-type CheckFn<M> = dyn Fn(&Step<'_, M>) -> Result<(), <M as Machine>::Error> + Send + Sync;
-type ApplyFn<M> = dyn Fn(&Step<'_, M>, &mut <M as Machine>::Entity) + Send + Sync;
-type VerifyFn<M> = dyn Fn(&Step<'_, M>, &<M as Machine>::Entity) -> Result<(), <M as Machine>::Error>
-    + Send
-    + Sync;
-type EffectsFn<M> =
-    dyn Fn(&Step<'_, M>, &<M as Machine>::Entity) -> Vec<<M as Machine>::Effect> + Send + Sync;
 
 /// Where a global rule applies.
 #[must_use]
@@ -205,127 +219,65 @@ impl<M: Machine> fmt::Debug for Scope<M> {
     }
 }
 
-/// A named rule built from a closure.
-///
-/// Constructed with [`guard`], [`mutate`], [`verify`], or [`emit`].
-#[must_use]
-pub struct NamedRule<M: Machine> {
-    name: &'static str,
-    kind: RuleKind<M>,
-}
+// Single-phase closure adapters registered by `EngineBuilder::{check, apply, verify, effects}`.
+pub(crate) struct CheckRule<F>(pub(crate) &'static str, pub(crate) F);
+pub(crate) struct ApplyRule<F>(pub(crate) &'static str, pub(crate) F);
+pub(crate) struct VerifyRule<F>(pub(crate) &'static str, pub(crate) F);
+pub(crate) struct EffectsRule<F>(pub(crate) &'static str, pub(crate) F);
 
-/// The single behavior a [`NamedRule`] can have.
-enum RuleKind<M: Machine> {
-    Check(Box<CheckFn<M>>),
-    Apply(Box<ApplyFn<M>>),
-    Verify(Box<VerifyFn<M>>),
-    Effects(Box<EffectsFn<M>>),
-}
-
-impl<M: Machine> Rule<M> for NamedRule<M> {
+impl<M, F> Rule<M> for CheckRule<F>
+where
+    M: Machine,
+    F: Fn(&Step<'_, M>) -> Result<(), M::Error> + Send + Sync + 'static,
+{
     fn check(&self, step: &Step<'_, M>) -> Result<(), M::Error> {
-        match &self.kind {
-            RuleKind::Check(check) => check(step),
-            _ => Ok(()),
-        }
-    }
-
-    fn apply(&self, step: &Step<'_, M>, entity: &mut M::Entity) {
-        if let RuleKind::Apply(apply) = &self.kind {
-            apply(step, entity);
-        }
-    }
-
-    fn verify(&self, step: &Step<'_, M>, next: &M::Entity) -> Result<(), M::Error> {
-        match &self.kind {
-            RuleKind::Verify(verify) => verify(step, next),
-            _ => Ok(()),
-        }
-    }
-
-    fn effects(&self, step: &Step<'_, M>, next: &M::Entity) -> Vec<M::Effect> {
-        match &self.kind {
-            RuleKind::Effects(effects) => effects(step, next),
-            _ => Vec::new(),
-        }
+        (self.1)(step)
     }
 
     fn name(&self) -> &'static str {
-        self.name
+        self.0
     }
 }
 
-impl<M: Machine> fmt::Debug for NamedRule<M> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("NamedRule")
-            .field("name", &self.name)
-            .finish()
-    }
-}
-
-/// Creates a named guard: a precondition without writing an `impl Rule`.
-///
-/// ```
-/// # use fsm_forge::{guard, Machine, Rule, Step};
-/// # struct M;
-/// # impl Machine for M {
-/// #     type State = u8;
-/// #     type Event = u8;
-/// #     type Entity = u8;
-/// #     type Input = ();
-/// #     type Effect = ();
-/// #     type Error = &'static str;
-/// #     fn state(entity: &u8) -> u8 { *entity }
-/// #     fn set_state(entity: &mut u8, state: u8) { *entity = state; }
-/// # }
-/// let rule = guard::<M>("positive", |step| {
-///     if *step.entity > 0 { Ok(()) } else { Err("must be positive") }
-/// });
-/// assert_eq!(rule.name(), "positive");
-/// ```
-pub fn guard<M: Machine>(
-    name: &'static str,
-    check: impl Fn(&Step<'_, M>) -> Result<(), M::Error> + Send + Sync + 'static,
-) -> NamedRule<M> {
-    NamedRule {
-        name,
-        kind: RuleKind::Check(Box::new(check)),
-    }
-}
-
-/// Creates a named change: a mutation without writing an `impl Rule`.
-pub fn mutate<M: Machine>(
-    name: &'static str,
-    apply: impl Fn(&Step<'_, M>, &mut M::Entity) + Send + Sync + 'static,
-) -> NamedRule<M> {
-    NamedRule {
-        name,
-        kind: RuleKind::Apply(Box::new(apply)),
-    }
-}
-
-/// Creates a named post-condition: it sees the modified entity and the destination state.
-pub fn verify<M: Machine>(
-    name: &'static str,
-    check: impl Fn(&Step<'_, M>, &M::Entity) -> Result<(), M::Error> + Send + Sync + 'static,
-) -> NamedRule<M> {
-    NamedRule {
-        name,
-        kind: RuleKind::Verify(Box::new(check)),
-    }
-}
-
-/// Creates a rule that emits a single effect.
-///
-/// Requires `M::Effect: Clone + Send + Sync + 'static`: rules are shared across threads
-/// and the engine asks for effects by reference.
-pub fn emit<M: Machine>(name: &'static str, effect: M::Effect) -> NamedRule<M>
+impl<M, F> Rule<M> for ApplyRule<F>
 where
-    M::Effect: Clone + Send + Sync + 'static,
+    M: Machine,
+    F: Fn(&Step<'_, M>, &mut M::Entity) + Send + Sync + 'static,
 {
-    NamedRule {
-        name,
-        kind: RuleKind::Effects(Box::new(move |_step, _next| vec![effect.clone()])),
+    fn apply(&self, step: &Step<'_, M>, entity: &mut M::Entity) {
+        (self.1)(step, entity);
+    }
+
+    fn name(&self) -> &'static str {
+        self.0
+    }
+}
+
+impl<M, F> Rule<M> for VerifyRule<F>
+where
+    M: Machine,
+    F: Fn(&Step<'_, M>, &M::Entity) -> Result<(), M::Error> + Send + Sync + 'static,
+{
+    fn verify(&self, step: &Step<'_, M>, next: &M::Entity) -> Result<(), M::Error> {
+        (self.1)(step, next)
+    }
+
+    fn name(&self) -> &'static str {
+        self.0
+    }
+}
+
+impl<M, F> Rule<M> for EffectsRule<F>
+where
+    M: Machine,
+    F: Fn(&Step<'_, M>, &M::Entity) -> Vec<M::Effect> + Send + Sync + 'static,
+{
+    fn effects(&self, step: &Step<'_, M>, next: &M::Entity) -> Vec<M::Effect> {
+        (self.1)(step, next)
+    }
+
+    fn name(&self) -> &'static str {
+        self.0
     }
 }
 
@@ -354,10 +306,18 @@ mod tests {
 
     impl Rule<M> for Plain {}
 
-    /// A rule generic over a type with a module path, like `Audit<app::Invoice>`.
     struct Audit<T>(T);
 
     impl<T: Send + Sync + 'static> Rule<M> for Audit<T> {}
+
+    struct Outer<T>(std::marker::PhantomData<T>);
+
+    impl<T> Outer<T> {
+        fn inner_name() -> &'static str {
+            struct InnerRule;
+            short_type_name::<InnerRule>()
+        }
+    }
 
     #[test]
     fn default_name_drops_the_module_path() {
@@ -366,17 +326,28 @@ mod tests {
 
     #[test]
     fn default_name_drops_generic_arguments_and_their_paths() {
-        // `type_name` is `...::Audit<alloc::string::String>`: cutting at the last `::`
-        // first would give `String>`.
         assert_eq!(Audit(String::new()).name(), "Audit");
         assert_eq!(Audit(vec![Plain]).name(), "Audit");
     }
 
     #[test]
-    fn short_type_name_handles_nested_generics() {
+    fn short_type_name_handles_nested_generics_and_fn_arrows() {
         assert_eq!(
             short_type_name::<std::collections::HashMap<String, Vec<u8>>>(),
             "HashMap"
         );
+        assert_eq!(short_type_name::<Audit<fn(u8) -> bool>>(), "Audit");
+        assert_eq!(
+            Outer::<std::collections::HashMap<String, u8>>::inner_name(),
+            "InnerRule"
+        );
+    }
+
+    #[test]
+    fn short_type_name_leaves_non_nominal_types_intact() {
+        assert!(short_type_name::<(std::cmp::Ordering, u8)>().starts_with('('));
+        assert!(short_type_name::<[std::cmp::Ordering; 2]>().starts_with('['));
+        assert!(short_type_name::<dyn std::fmt::Display + Send + Sync>().starts_with("dyn "));
+        assert!(short_type_name::<fn(std::cmp::Ordering) -> bool>().starts_with("fn("));
     }
 }

@@ -5,6 +5,48 @@ The format follows Keep a Changelog and Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- Inline scoped-rule methods on `EngineBuilder`: `.check`, `.apply`, `.verify`, `.effects`,
+  and `.emit`, with full type inference from the builder's `Machine` type and no double
+  boxing.
+- `BuildError::ShadowedOriginless` to report edges with `FROM: &[]` that can never be
+  selected because every reachable state already defines an explicit edge for that event.
+- `Deref<Target = [BuildError<M>]>` on `BuildErrors<M>`, `Display` on `Phase`, and
+  `std::error::Error` on `AppliedError<M>`.
+- Incremental, numbered example suite (`01_minimal`, `02_phases`, `03_counter`,
+  `04_scopes`, `05_diagnostics`, `06_from_any`, `07_topology`, `08_ticket`), introducing
+  one library capability per step.
+
+### Changed
+
+- `Edge<M>` is now independent from `Rule<M>` and declares its own optional `check`,
+  `apply`, `verify`, `effects`, and `name` methods. Edges no longer require an empty
+  `impl Rule<M>` block and cannot be passed to `EngineBuilder::rule` by mistake.
+- `Machine::Error` now requires `Debug` in addition to `Display + Send + Sync + 'static`.
+- `Engine::available` now returns `&[M::Event]` backed by a build-time state index instead
+  of allocating a `Vec<M::Event>`.
+- `BuildError::AmbiguousOriginless` is now a tuple variant `AmbiguousOriginless(M::Event)`
+  consistent with the other single-field error variants.
+- `Outcome<M>` is now marked `#[must_use]`, and `Outcome::effects_of` was removed in favor
+  of direct field access on `Outcome::effects`.
+- Free helpers `guard`, `mutate`, `verify`, `emit`, `NamedRule`, and `prelude` were
+  replaced by the direct `EngineBuilder` phase methods and root exports.
+- `Rejection`, `BuildError`, `BuildErrors`, `Step`, and `Transition` now use structural
+  `Debug` formatting while keeping human-readable labels in `Display`.
+
+### Fixed
+
+- `Outcome::Debug` now formats `entity` and the full `effects` list so failed `assert_eq!`
+  checks show the actual differences.
+- `EngineBuilder::initial` now always sets the primary root at index `0` even when called
+  after `EngineBuilder::roots`.
+- `Rule::name` / `Edge::name` default now preserves inner type names inside generic outer
+  types, handles `fn(...) -> ...` type arguments, and leaves non-nominal types intact.
+- `Engine::to_mermaid` now handles empty and symbol-only state `Debug` outputs,
+  disambiguates all `stateDiagram-v2` reserved keywords, and sanitizes `:`, `;`, and `%%`
+  in labels.
+
 ## [0.1.0] - 2026-11-07
 
 First public release.

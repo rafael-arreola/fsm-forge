@@ -1,6 +1,9 @@
 //! Simple topologies: no rules, self-loops, several origins, and from-any mode.
 
-use fsm_forge::{Edge, Engine, Machine, Rejection, Rule};
+use std::cell::Cell;
+use std::rc::Rc;
+
+use fsm_forge::{Edge, Engine, Machine, Rejection};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Door: basic edges, a self-loop, several origins, and an edge without origin
@@ -73,8 +76,6 @@ impl Edge<DoorMachine> for OpenDoor {
     const TO: DoorState = DoorState::Open;
 }
 
-impl Rule<DoorMachine> for OpenDoor {}
-
 struct CloseDoor;
 
 impl Edge<DoorMachine> for CloseDoor {
@@ -82,8 +83,6 @@ impl Edge<DoorMachine> for CloseDoor {
     const FROM: &'static [DoorState] = &[DoorState::Open];
     const TO: DoorState = DoorState::Closed;
 }
-
-impl Rule<DoorMachine> for CloseDoor {}
 
 struct HoldOpen;
 
@@ -93,8 +92,6 @@ impl Edge<DoorMachine> for HoldOpen {
     const TO: DoorState = DoorState::Open;
 }
 
-impl Rule<DoorMachine> for HoldOpen {}
-
 struct LockDoorFromClosed;
 
 impl Edge<DoorMachine> for LockDoorFromClosed {
@@ -102,8 +99,6 @@ impl Edge<DoorMachine> for LockDoorFromClosed {
     const FROM: &'static [DoorState] = &[DoorState::Closed];
     const TO: DoorState = DoorState::Locked;
 }
-
-impl Rule<DoorMachine> for LockDoorFromClosed {}
 
 struct LockDoorFromOpen;
 
@@ -113,8 +108,6 @@ impl Edge<DoorMachine> for LockDoorFromOpen {
     const TO: DoorState = DoorState::Locked;
 }
 
-impl Rule<DoorMachine> for LockDoorFromOpen {}
-
 struct UnlockDoor;
 
 impl Edge<DoorMachine> for UnlockDoor {
@@ -123,8 +116,6 @@ impl Edge<DoorMachine> for UnlockDoor {
     const TO: DoorState = DoorState::Closed;
 }
 
-impl Rule<DoorMachine> for UnlockDoor {}
-
 struct ForceOpen;
 
 impl Edge<DoorMachine> for ForceOpen {
@@ -132,8 +123,6 @@ impl Edge<DoorMachine> for ForceOpen {
     const FROM: &'static [DoorState] = &[];
     const TO: DoorState = DoorState::Open;
 }
-
-impl Rule<DoorMachine> for ForceOpen {}
 
 fn door_engine() -> Engine<DoorMachine> {
     Engine::<DoorMachine>::builder()
@@ -322,7 +311,7 @@ fn diagnose_available_and_target_agree_with_the_topology() {
 
     assert_eq!(
         engine.available(&door),
-        vec![DoorEvent::OpenDoor, DoorEvent::LockDoor]
+        &[DoorEvent::OpenDoor, DoorEvent::LockDoor]
     );
 
     let detailed = engine.available_detailed(&door, &());
@@ -334,21 +323,6 @@ fn diagnose_available_and_target_agree_with_the_topology() {
         Some(DoorState::Locked)
     );
     assert_eq!(engine.target(DoorEvent::ForceOpen, DoorState::Closed), None);
-}
-
-#[test]
-fn execute_returns_the_updated_entity() {
-    let engine = door_engine();
-    let door = Door {
-        state: DoorState::Closed,
-    };
-
-    let outcome = engine
-        .execute(&door, DoorEvent::OpenDoor, &())
-        .expect("transition is valid");
-
-    assert_eq!(outcome.entity.state, DoorState::Open);
-    assert_eq!(door.state, DoorState::Closed);
 }
 
 #[test]
@@ -433,8 +407,6 @@ impl Edge<LightMachine> for NextFromRed {
     const TO: LightState = LightState::Green;
 }
 
-impl Rule<LightMachine> for NextFromRed {}
-
 struct NextFromGreen;
 
 impl Edge<LightMachine> for NextFromGreen {
@@ -442,8 +414,6 @@ impl Edge<LightMachine> for NextFromGreen {
     const FROM: &'static [LightState] = &[LightState::Green];
     const TO: LightState = LightState::Yellow;
 }
-
-impl Rule<LightMachine> for NextFromGreen {}
 
 struct NextFromYellow;
 
@@ -453,8 +423,6 @@ impl Edge<LightMachine> for NextFromYellow {
     const TO: LightState = LightState::Red;
 }
 
-impl Rule<LightMachine> for NextFromYellow {}
-
 struct Emergency;
 
 impl Edge<LightMachine> for Emergency {
@@ -463,8 +431,6 @@ impl Edge<LightMachine> for Emergency {
     const TO: LightState = LightState::Red;
 }
 
-impl Rule<LightMachine> for Emergency {}
-
 struct Reset;
 
 impl Edge<LightMachine> for Reset {
@@ -472,8 +438,6 @@ impl Edge<LightMachine> for Reset {
     const FROM: &'static [LightState] = &[];
     const TO: LightState = LightState::Red;
 }
-
-impl Rule<LightMachine> for Reset {}
 
 fn light_engine() -> Engine<LightMachine> {
     Engine::<LightMachine>::builder()
@@ -532,4 +496,107 @@ fn reset_is_only_reachable_through_from_any() {
         .expect("from_any can reset the light");
     assert_eq!(outcome.transition.to, LightState::Red);
     assert!(outcome.transition.from_any);
+}
+
+#[test]
+fn engine_is_send_and_sync_even_when_entity_input_and_effect_are_not() {
+    struct LocalMachine;
+
+    impl Machine for LocalMachine {
+        type State = u8;
+        type Event = u8;
+        type Entity = Rc<u8>;
+        type Input = Rc<Cell<u8>>;
+        type Effect = Rc<Cell<u8>>;
+        type Error = &'static str;
+
+        fn state(entity: &Self::Entity) -> u8 {
+            **entity
+        }
+
+        fn set_state(entity: &mut Self::Entity, state: u8) {
+            *entity = Rc::new(state);
+        }
+    }
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    assert_send_sync::<Engine<LocalMachine>>();
+}
+
+#[test]
+fn custom_names_and_hostile_mermaid_labels_are_formatted_safely() {
+    struct CustomMachine;
+
+    impl Machine for CustomMachine {
+        type State = u8;
+        type Event = u8;
+        type Entity = u8;
+        type Input = ();
+        type Effect = ();
+        type Error = &'static str;
+
+        fn state(entity: &u8) -> u8 {
+            *entity
+        }
+
+        fn set_state(entity: &mut u8, state: u8) {
+            *entity = state;
+        }
+
+        fn state_name(state: u8) -> String {
+            match state {
+                0 => String::new(),
+                _ => "Active: 100%%".to_string(),
+            }
+        }
+
+        fn event_name(event: u8) -> String {
+            match event {
+                1 => "Retry { max: 3 }; %%now".to_string(),
+                _ => String::new(),
+            }
+        }
+    }
+
+    struct Go;
+
+    impl Edge<CustomMachine> for Go {
+        const EVENT: u8 = 1;
+        const FROM: &'static [u8] = &[0];
+        const TO: u8 = 1;
+    }
+
+    struct Force;
+
+    impl Edge<CustomMachine> for Force {
+        const EVENT: u8 = 2;
+        const FROM: &'static [u8] = &[];
+        const TO: u8 = 1;
+    }
+
+    let engine = Engine::<CustomMachine>::builder()
+        .edge(Go)
+        .edge(Force)
+        .initial(0)
+        .build()
+        .expect("valid machine");
+
+    let err = engine.execute(&1, 1, &()).expect_err("not allowed from 1");
+    assert_eq!(
+        err.to_string(),
+        "Retry { max: 3 }; %%now is not allowed from Active: 100%%"
+    );
+
+    let diagram = engine.to_mermaid();
+    assert!(diagram.contains("state \"0\" as 0"), "{diagram}");
+    assert!(
+        diagram.contains("state \"Active: 100% %\" as 1"),
+        "{diagram}"
+    );
+    assert!(
+        diagram.contains("0 --> 1 : Retry { max, 3 }, % %now"),
+        "{diagram}"
+    );
+    assert!(diagram.contains("note right of 1 : (unnamed)"), "{diagram}");
 }

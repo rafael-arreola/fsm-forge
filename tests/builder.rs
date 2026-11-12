@@ -1,6 +1,6 @@
 //! Builder validation: topology errors, roots, reachability, and edges without origin.
 
-use fsm_forge::{BuildError, BuildErrors, Edge, Engine, Machine, Rejection, Rule};
+use fsm_forge::{BuildError, BuildErrors, Edge, Engine, Machine, Rejection};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ShipmentState {
@@ -78,8 +78,6 @@ impl Edge<ShipmentMachine> for CreateShipment {
     const TO: ShipmentState = ShipmentState::Draft;
 }
 
-impl Rule<ShipmentMachine> for CreateShipment {}
-
 struct ConfirmShipment;
 
 impl Edge<ShipmentMachine> for ConfirmShipment {
@@ -87,8 +85,6 @@ impl Edge<ShipmentMachine> for ConfirmShipment {
     const FROM: &'static [ShipmentState] = &[ShipmentState::Draft];
     const TO: ShipmentState = ShipmentState::Confirmed;
 }
-
-impl Rule<ShipmentMachine> for ConfirmShipment {}
 
 struct DispatchShipment;
 
@@ -98,8 +94,6 @@ impl Edge<ShipmentMachine> for DispatchShipment {
     const TO: ShipmentState = ShipmentState::Ready;
 }
 
-impl Rule<ShipmentMachine> for DispatchShipment {}
-
 struct DeliverShipment;
 
 impl Edge<ShipmentMachine> for DeliverShipment {
@@ -107,8 +101,6 @@ impl Edge<ShipmentMachine> for DeliverShipment {
     const FROM: &'static [ShipmentState] = &[ShipmentState::Ready];
     const TO: ShipmentState = ShipmentState::Delivered;
 }
-
-impl Rule<ShipmentMachine> for DeliverShipment {}
 
 struct CancelDraft;
 
@@ -118,8 +110,6 @@ impl Edge<ShipmentMachine> for CancelDraft {
     const TO: ShipmentState = ShipmentState::Cancelled;
 }
 
-impl Rule<ShipmentMachine> for CancelDraft {}
-
 struct CancelConfirmed;
 
 impl Edge<ShipmentMachine> for CancelConfirmed {
@@ -128,8 +118,6 @@ impl Edge<ShipmentMachine> for CancelConfirmed {
     const TO: ShipmentState = ShipmentState::Cancelled;
 }
 
-impl Rule<ShipmentMachine> for CancelConfirmed {}
-
 struct AdminCancel;
 
 impl Edge<ShipmentMachine> for AdminCancel {
@@ -137,8 +125,6 @@ impl Edge<ShipmentMachine> for AdminCancel {
     const FROM: &'static [ShipmentState] = &[];
     const TO: ShipmentState = ShipmentState::Cancelled;
 }
-
-impl Rule<ShipmentMachine> for AdminCancel {}
 
 /// Same event and origin as [`ConfirmShipment`], different target: used to prove
 /// that `build()` reports the conflict.
@@ -150,8 +136,6 @@ impl Edge<ShipmentMachine> for ConfirmDraftToCancelled {
     const TO: ShipmentState = ShipmentState::Cancelled;
 }
 
-impl Rule<ShipmentMachine> for ConfirmDraftToCancelled {}
-
 /// Second edge without origin for `AdminCancel`: used to prove the ambiguity.
 struct AdminCancelToDelivered;
 
@@ -161,8 +145,6 @@ impl Edge<ShipmentMachine> for AdminCancelToDelivered {
     const TO: ShipmentState = ShipmentState::Delivered;
 }
 
-impl Rule<ShipmentMachine> for AdminCancelToDelivered {}
-
 struct OrphanStep;
 
 impl Edge<ShipmentMachine> for OrphanStep {
@@ -170,8 +152,6 @@ impl Edge<ShipmentMachine> for OrphanStep {
     const FROM: &'static [ShipmentState] = &[ShipmentState::Orphan];
     const TO: ShipmentState = ShipmentState::OrphanNext;
 }
-
-impl Rule<ShipmentMachine> for OrphanStep {}
 
 fn valid_engine() -> Result<Engine<ShipmentMachine>, BuildErrors<ShipmentMachine>> {
     Engine::<ShipmentMachine>::builder()
@@ -283,13 +263,59 @@ fn missing_state_is_reported() {
 
 #[test]
 fn a_root_counts_as_a_mentioned_state() {
+    // `Initial` appears in no edge, only in `roots`.
     let result = Engine::<ShipmentMachine>::builder()
-        .edge(CreateShipment)
-        .require_states([ShipmentState::Initial, ShipmentState::Draft])
-        .initial(ShipmentState::Initial)
+        .edge(ConfirmShipment)
+        .roots([ShipmentState::Initial, ShipmentState::Draft])
+        .require_states([
+            ShipmentState::Initial,
+            ShipmentState::Draft,
+            ShipmentState::Confirmed,
+        ])
         .build();
 
     assert!(result.is_ok());
+}
+
+#[test]
+fn initial_always_sets_the_primary_root_regardless_of_call_order() {
+    let engine = Engine::<ShipmentMachine>::builder()
+        .edge(CreateShipment)
+        .edge(ConfirmShipment)
+        .roots([ShipmentState::Draft, ShipmentState::Initial])
+        .initial(ShipmentState::Initial)
+        .build()
+        .expect("valid machine");
+
+    assert_eq!(engine.initial(), Some(ShipmentState::Initial));
+    assert_eq!(
+        engine.roots(),
+        &[ShipmentState::Initial, ShipmentState::Draft]
+    );
+}
+
+#[test]
+fn repeated_origins_in_one_edge_are_deduplicated() {
+    struct DuplicateFrom;
+
+    impl Edge<ShipmentMachine> for DuplicateFrom {
+        const EVENT: ShipmentEvent = ShipmentEvent::Create;
+        const FROM: &'static [ShipmentState] = &[ShipmentState::Initial, ShipmentState::Initial];
+        const TO: ShipmentState = ShipmentState::Draft;
+    }
+
+    let engine = Engine::<ShipmentMachine>::builder()
+        .edge(DuplicateFrom)
+        .initial(ShipmentState::Initial)
+        .build()
+        .expect("repeated origin in same edge is deduplicated");
+
+    assert_eq!(
+        engine.available(&Shipment {
+            state: ShipmentState::Initial
+        }),
+        &[ShipmentEvent::Create]
+    );
 }
 
 #[test]
@@ -319,12 +345,7 @@ fn several_edges_without_origin_are_ambiguous() {
         .build();
 
     let errors = expect_build_error(result);
-    assert!(errors.iter().any(|error| matches!(
-        error,
-        BuildError::AmbiguousOriginless {
-            event: ShipmentEvent::AdminCancel,
-        }
-    )));
+    assert!(errors.contains(&BuildError::AmbiguousOriginless(ShipmentEvent::AdminCancel)));
 }
 
 #[test]
@@ -339,7 +360,7 @@ fn an_ambiguous_event_is_reported_once_however_many_edges_repeat_it() {
     let errors = expect_build_error(result);
     let ambiguous = errors
         .iter()
-        .filter(|error| matches!(error, BuildError::AmbiguousOriginless { .. }))
+        .filter(|error| matches!(error, BuildError::AmbiguousOriginless(_)))
         .count();
     assert_eq!(ambiguous, 1, "{errors}");
 }
@@ -402,6 +423,10 @@ fn build_reports_every_independent_error() {
     let message = errors.to_string();
     assert!(message.contains("has two edges"), "{message}");
     assert!(message.contains("has no edge"), "{message}");
+
+    let debug = format!("{errors:?}");
+    assert!(debug.contains("BuildErrors"), "{debug}");
+    assert!(debug.contains("Conflict"), "{debug}");
 }
 
 #[test]
@@ -413,6 +438,58 @@ fn edge_without_origin_counts_for_reachability() {
         .build();
 
     assert!(result.is_ok());
+}
+
+#[test]
+fn shadowed_originless_edge_is_reported_even_when_its_target_is_reachable() {
+    struct AdminCancelExplicit;
+
+    impl Edge<ShipmentMachine> for AdminCancelExplicit {
+        const EVENT: ShipmentEvent = ShipmentEvent::AdminCancel;
+        const FROM: &'static [ShipmentState] = &[ShipmentState::Initial, ShipmentState::Draft];
+        const TO: ShipmentState = ShipmentState::Draft;
+    }
+
+    struct DeadOriginlessToDraft;
+
+    impl Edge<ShipmentMachine> for DeadOriginlessToDraft {
+        const EVENT: ShipmentEvent = ShipmentEvent::AdminCancel;
+        const FROM: &'static [ShipmentState] = &[];
+        const TO: ShipmentState = ShipmentState::Draft;
+    }
+
+    // `Draft` is reachable, yet `DeadOriginlessToDraft` can never be selected because
+    // every reachable state (`Initial`, `Draft`) already has an explicit edge.
+    let errors = expect_build_error(
+        Engine::<ShipmentMachine>::builder()
+            .edge(CreateShipment)
+            .edge(AdminCancelExplicit)
+            .edge(DeadOriginlessToDraft)
+            .initial(ShipmentState::Initial)
+            .build(),
+    );
+    assert_eq!(
+        &*errors,
+        &[BuildError::ShadowedOriginless(ShipmentEvent::AdminCancel)]
+    );
+
+    // And when the shadowed edge points to an otherwise disconnected state (`Cancelled`),
+    // both `ShadowedOriginless` and `UnreachableState` are reported.
+    let errors = expect_build_error(
+        Engine::<ShipmentMachine>::builder()
+            .edge(CreateShipment)
+            .edge(AdminCancelExplicit)
+            .edge(AdminCancel)
+            .initial(ShipmentState::Initial)
+            .build(),
+    );
+    assert_eq!(
+        &*errors,
+        &[
+            BuildError::ShadowedOriginless(ShipmentEvent::AdminCancel),
+            BuildError::UnreachableState(ShipmentState::Cancelled),
+        ]
+    );
 }
 
 #[test]

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use fsm_forge::{Edge, Engine, Machine, Phase, Rejection, Rule, Scope, Step, emit, guard};
+use fsm_forge::{Edge, Engine, Machine, Phase, Rejection, Rule, Scope, Step};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Invoice: edge methods, a hand-written rule, and a failing verify
@@ -114,9 +114,7 @@ impl Edge<InvoiceMachine> for Issue {
     const EVENT: InvoiceEvent = InvoiceEvent::Issue;
     const FROM: &'static [InvoiceState] = &[InvoiceState::Draft];
     const TO: InvoiceState = InvoiceState::Issued;
-}
 
-impl Rule<InvoiceMachine> for Issue {
     fn check(&self, step: &Step<'_, InvoiceMachine>) -> Result<(), &'static str> {
         if step.entity.total > 0 {
             Ok(())
@@ -158,17 +156,13 @@ impl Edge<InvoiceMachine> for Pay {
     const TO: InvoiceState = InvoiceState::Paid;
 }
 
-impl Rule<InvoiceMachine> for Pay {}
-
 struct Cancel;
 
 impl Edge<InvoiceMachine> for Cancel {
     const EVENT: InvoiceEvent = InvoiceEvent::Cancel;
     const FROM: &'static [InvoiceState] = &[InvoiceState::Draft];
     const TO: InvoiceState = InvoiceState::Cancelled;
-}
 
-impl Rule<InvoiceMachine> for Cancel {
     fn apply(&self, _step: &Step<'_, InvoiceMachine>, invoice: &mut Invoice) {
         invoice.cancelled = true;
     }
@@ -191,18 +185,30 @@ fn invoice_engine() -> Engine<InvoiceMachine> {
         .edge(Issue)
         .edge(Pay)
         .edge(Cancel)
-        .rule(
+        .check(
             Scope::on(&[InvoiceEvent::Issue]),
-            guard("non_negative_input", |step| {
+            "non_negative_input",
+            |step| {
                 if *step.input >= 0 {
                     Ok(())
                 } else {
                     Err("input must be non-negative")
                 }
-            }),
+            },
         )
         .rule(Scope::on(&[InvoiceEvent::Pay]), ExactPayment)
-        .rule(Scope::always(), emit("audit", "audit"))
+        .verify(
+            Scope::entering(&[InvoiceState::Cancelled]),
+            "uncancelled_guard",
+            |_step, next| {
+                if next.cancelled {
+                    Err("global cancel invariant failed")
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .emit(Scope::always(), "audit", "audit")
         .initial(InvoiceState::Draft)
         .require_events([InvoiceEvent::Issue, InvoiceEvent::Pay, InvoiceEvent::Cancel])
         .require_states([
@@ -245,11 +251,8 @@ fn issue_runs_check_apply_verify_and_effects() {
         outcome.effect_values().copied().collect::<Vec<_>>(),
         vec!["invoice.issued", "audit"]
     );
-    assert_eq!(
-        outcome.effects_of("Issue").copied().collect::<Vec<_>>(),
-        vec!["invoice.issued"]
-    );
     assert_eq!(outcome.effects[0].rule, "Issue");
+    assert!(!outcome.transition.is_self_loop());
     assert!(!outcome.transition.from_any);
 
     // The original entity never changes.
@@ -281,18 +284,22 @@ fn all_check_errors_are_collected_together() {
 }
 
 #[test]
-fn verify_failure_discards_mutations_and_effects() {
+fn verify_collects_all_errors_and_discards_mutations_and_effects() {
     let engine = invoice_engine();
     let invoice = draft();
 
     let rejection = engine
         .execute(&invoice, InvoiceEvent::Cancel, &0)
-        .expect_err("the verify method always fails");
+        .expect_err("both edge verify and global verify fail");
 
     let errors = rejection.rules().expect("rejection comes from rules");
-    assert_eq!(errors.len(), 1);
+    assert_eq!(errors.len(), 2);
     assert_eq!(errors[0].rule, "Cancel");
     assert_eq!(errors[0].phase, Phase::Verify);
+    assert_eq!(errors[0].error, "cancel verification failed");
+    assert_eq!(errors[1].rule, "uncancelled_guard");
+    assert_eq!(errors[1].phase, Phase::Verify);
+    assert_eq!(errors[1].error, "global cancel invariant failed");
     assert!(!invoice.cancelled);
     assert_eq!(invoice.state, InvoiceState::Draft);
 }
@@ -319,13 +326,7 @@ fn hand_written_rule_runs_check_apply_verify_and_effects() {
         outcome.effect_values().copied().collect::<Vec<_>>(),
         vec!["payment_recorded", "audit"]
     );
-    assert_eq!(
-        outcome
-            .effects_of("ExactPayment")
-            .copied()
-            .collect::<Vec<_>>(),
-        vec!["payment_recorded"]
-    );
+    assert_eq!(outcome.effects[0].rule, "ExactPayment");
 }
 
 #[test]
@@ -373,23 +374,6 @@ fn diagnose_does_not_run_effects() {
 }
 
 #[test]
-fn outcome_carries_the_result_and_is_not_a_self_loop() {
-    let engine = invoice_engine();
-
-    let outcome = engine
-        .execute(&draft(), InvoiceEvent::Issue, &0)
-        .expect("issue is valid");
-
-    assert!(!outcome.transition.is_self_loop());
-    assert_eq!(outcome.entity.state, InvoiceState::Issued);
-    assert_eq!(outcome.entity.note, Some("standard"));
-    assert_eq!(
-        outcome.effect_values().copied().collect::<Vec<_>>(),
-        vec!["invoice.issued", "audit"]
-    );
-}
-
-#[test]
 fn rejection_without_rules_has_no_rule_errors() {
     let engine = invoice_engine();
 
@@ -399,4 +383,91 @@ fn rejection_without_rules_has_no_rule_errors() {
 
     assert!(rejection.rules().is_none());
     assert_eq!(rejection.rule_errors().count(), 0);
+    assert!(format!("{rejection:?}").contains("NotAllowed"));
+}
+
+#[test]
+fn builder_closure_helpers_infer_types_and_run_all_four_phases() {
+    #[derive(Debug, PartialEq, Eq)]
+    struct NonCloneEffect(String);
+
+    struct M;
+
+    impl Machine for M {
+        type State = InvoiceState;
+        type Event = InvoiceEvent;
+        type Entity = Invoice;
+        type Input = i64;
+        type Effect = NonCloneEffect;
+        type Error = &'static str;
+
+        fn state(invoice: &Invoice) -> InvoiceState {
+            invoice.state
+        }
+
+        fn set_state(invoice: &mut Invoice, state: InvoiceState) {
+            invoice.state = state;
+        }
+    }
+
+    struct DynamicIssue;
+
+    impl Edge<M> for DynamicIssue {
+        const EVENT: InvoiceEvent = InvoiceEvent::Issue;
+        const FROM: &'static [InvoiceState] = &[InvoiceState::Draft];
+        const TO: InvoiceState = InvoiceState::Issued;
+    }
+
+    // Zero turbofish annotations inside `.check`, `.apply`, `.verify`, or `.effects`,
+    // even while accessing fields of `step.entity`, `step.input`, and `next`.
+    let engine = Engine::<M>::builder()
+        .edge(DynamicIssue)
+        .check(Scope::always(), "positive_total", |step| {
+            if step.entity.total > 0 {
+                Ok(())
+            } else {
+                Err("total must be positive")
+            }
+        })
+        .apply(Scope::always(), "record_deposit", |step, invoice| {
+            // In `apply`, the state has not been moved yet.
+            assert_eq!(invoice.state, step.from);
+            invoice.paid += *step.input;
+        })
+        .verify(Scope::always(), "destination_and_balance", |step, next| {
+            // In `verify`, the destination state is already set on `next`.
+            assert_eq!(next.state, step.to);
+            if next.paid <= next.total {
+                Ok(())
+            } else {
+                Err("overpaid")
+            }
+        })
+        .effects(Scope::always(), "audit_dynamic", |step, next| {
+            vec![NonCloneEffect(format!(
+                "{:?}->{:?}:paid={}",
+                step.from, next.state, next.paid
+            ))]
+        })
+        .build()
+        .expect("valid machine");
+
+    let outcome = engine
+        .execute(&draft(), InvoiceEvent::Issue, &25)
+        .expect("transition succeeds");
+
+    let debug = format!("{outcome:?}");
+    assert!(debug.contains("entity"), "{debug}");
+    assert!(debug.contains("Draft->Issued:paid=25"), "{debug}");
+
+    // Move `entity` first, then consume `effects` by value without cloning or `mut`.
+    let updated = outcome.entity;
+    let effects: Vec<NonCloneEffect> = outcome.effects.into_iter().map(|fx| fx.effect).collect();
+
+    assert_eq!(updated.state, InvoiceState::Issued);
+    assert_eq!(updated.paid, 25);
+    assert_eq!(
+        effects,
+        vec![NonCloneEffect("Draft->Issued:paid=25".to_string())]
+    );
 }

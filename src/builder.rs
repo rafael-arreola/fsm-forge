@@ -3,10 +3,10 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::edge::{CompiledEdge, Edge};
-use crate::engine::{Engine, EventIndex};
+use crate::engine::Engine;
 use crate::error::{BuildError, BuildErrors};
 use crate::machine::Machine;
-use crate::rule::{Rule, Scope};
+use crate::rule::{ApplyRule, CheckRule, EffectsRule, Rule, Scope, Step, VerifyRule};
 
 /// A machine declaration. `build()` validates it and returns the [`Engine`].
 #[must_use]
@@ -14,7 +14,7 @@ pub struct EngineBuilder<M: Machine> {
     edges: Vec<CompiledEdge<M>>,
     roots: Vec<M::State>,
     rules: Vec<(Scope<M>, Box<dyn Rule<M>>)>,
-    required: Vec<M::Event>,
+    required_events: Vec<M::Event>,
     required_states: Vec<M::State>,
 }
 
@@ -24,7 +24,7 @@ impl<M: Machine> Default for EngineBuilder<M> {
             edges: Vec::new(),
             roots: Vec::new(),
             rules: Vec::new(),
-            required: Vec::new(),
+            required_events: Vec::new(),
             required_states: Vec::new(),
         }
     }
@@ -37,8 +37,15 @@ impl<M: Machine> fmt::Debug for EngineBuilder<M> {
             .field("edges", &self.edges.len())
             .field("roots", &self.roots)
             .field("rules", &rules)
-            .finish()
+            .finish_non_exhaustive()
     }
+}
+
+/// Tracks the fallback edge `execute_from_any` uses when no edge starts at the current state.
+enum FromAnyFallback {
+    Single(usize),
+    Multiple,
+    Originless(usize),
 }
 
 impl<M: Machine> EngineBuilder<M> {
@@ -50,30 +57,94 @@ impl<M: Machine> EngineBuilder<M> {
 
     /// Global rule with a scope: its logic runs on every transition the scope selects.
     ///
-    /// # Do not register an edge here
+    /// Only [`Rule`] implementations are accepted here; passing an [`Edge`] is rejected at
+    /// compile time:
     ///
-    /// An [`Edge`] is also a [`Rule`], so the compiler accepts it, and neither the
-    /// compiler nor `build()` reports it. Its logic would run on every transition the
-    /// scope selects, not only on its own:
+    /// ```compile_fail
+    /// use fsm_forge::{Edge, Engine, Machine, Scope};
     ///
-    /// ```text
-    /// .edge(SolutionConfirmed)                    // correct: only Resolved -> Closed
-    /// .rule(Scope::always(), SolutionConfirmed)   // wrong: its check, apply, and effects
-    ///                                             // run on every transition
+    /// struct M;
+    /// impl Machine for M {
+    ///     type State = u8;
+    ///     type Event = u8;
+    ///     type Entity = u8;
+    ///     type Input = ();
+    ///     type Effect = ();
+    ///     type Error = &'static str;
+    ///     fn state(e: &u8) -> u8 { *e }
+    ///     fn set_state(e: &mut u8, s: u8) { *e = s; }
+    /// }
+    ///
+    /// struct Step0To1;
+    /// impl Edge<M> for Step0To1 {
+    ///     const EVENT: u8 = 1;
+    ///     const FROM: &'static [u8] = &[0];
+    ///     const TO: u8 = 1;
+    /// }
+    ///
+    /// let _ = Engine::<M>::builder().rule(Scope::always(), Step0To1);
     /// ```
-    ///
-    /// Register edges with [`EngineBuilder::edge`].
     pub fn rule(mut self, scope: Scope<M>, rule: impl Rule<M>) -> Self {
         self.rules.push((scope, Box::new(rule)));
         self
     }
 
-    /// Declares the entry state (the "state 0"). Calling it again accumulates roots.
+    /// Registers a named precondition (`check`) on every transition selected by `scope`.
+    pub fn check(
+        self,
+        scope: Scope<M>,
+        name: &'static str,
+        f: impl Fn(&Step<'_, M>) -> Result<(), M::Error> + Send + Sync + 'static,
+    ) -> Self {
+        self.rule(scope, CheckRule(name, f))
+    }
+
+    /// Registers a named mutation (`apply`) on every transition selected by `scope`.
+    pub fn apply(
+        self,
+        scope: Scope<M>,
+        name: &'static str,
+        f: impl Fn(&Step<'_, M>, &mut M::Entity) + Send + Sync + 'static,
+    ) -> Self {
+        self.rule(scope, ApplyRule(name, f))
+    }
+
+    /// Registers a named post-condition (`verify`) over the modified entity and new state.
+    pub fn verify(
+        self,
+        scope: Scope<M>,
+        name: &'static str,
+        f: impl Fn(&Step<'_, M>, &M::Entity) -> Result<(), M::Error> + Send + Sync + 'static,
+    ) -> Self {
+        self.rule(scope, VerifyRule(name, f))
+    }
+
+    /// Registers a named effect producer (`effects`) that can read the step and modified entity.
+    pub fn effects(
+        self,
+        scope: Scope<M>,
+        name: &'static str,
+        f: impl Fn(&Step<'_, M>, &M::Entity) -> Vec<M::Effect> + Send + Sync + 'static,
+    ) -> Self {
+        self.rule(scope, EffectsRule(name, f))
+    }
+
+    /// Registers a named rule that emits a single cloned effect on every matching transition.
+    pub fn emit(self, scope: Scope<M>, name: &'static str, effect: M::Effect) -> Self
+    where
+        M::Effect: Clone + Send + Sync + 'static,
+    {
+        self.effects(scope, name, move |_step, _next| vec![effect.clone()])
+    }
+
+    /// Declares the primary entry state returned by [`Engine::initial`], placing it first in
+    /// [`Engine::roots`].
     ///
     /// With roots declared, `build()` verifies that every state in the topology is
     /// reachable from at least one of them.
     pub fn initial(mut self, state: M::State) -> Self {
-        self.push_root(state);
+        self.roots.retain(|&existing| existing != state);
+        self.roots.insert(0, state);
         self
     }
 
@@ -81,7 +152,9 @@ impl<M: Machine> EngineBuilder<M> {
     /// than one state.
     pub fn roots(mut self, states: impl IntoIterator<Item = M::State>) -> Self {
         for state in states {
-            self.push_root(state);
+            if !self.roots.contains(&state) {
+                self.roots.push(state);
+            }
         }
         self
     }
@@ -89,7 +162,7 @@ impl<M: Machine> EngineBuilder<M> {
     /// `build()` fails if any of these events has no edge
     /// (e.g. `Event::iter()` with strum).
     pub fn require_events(mut self, events: impl IntoIterator<Item = M::Event>) -> Self {
-        self.required.extend(events);
+        self.required_events.extend(events);
         self
     }
 
@@ -103,25 +176,36 @@ impl<M: Machine> EngineBuilder<M> {
     /// Validates the declaration and returns the engine, or ALL the errors found.
     pub fn build(self) -> Result<Engine<M>, BuildErrors<M>> {
         let mut errors = Vec::new();
+        let mut push_error = |error: BuildError<M>| {
+            if !errors.contains(&error) {
+                errors.push(error);
+            }
+        };
 
         let mut by_origin = HashMap::new();
-        let mut by_event: HashMap<M::Event, EventIndex> = HashMap::new();
-        // Duplicates already reported: each one is reported once, however many edges
-        // repeat it.
-        let mut conflicts = HashSet::new();
-        let mut ambiguous = HashSet::new();
+        let mut by_state: HashMap<M::State, Vec<M::Event>> = HashMap::new();
+        let mut fallbacks: HashMap<M::Event, FromAnyFallback> = HashMap::new();
 
         for (index, edge) in self.edges.iter().enumerate() {
-            let event_index = by_event.entry(edge.event).or_default();
-            event_index.edges.push(index);
-
-            // The first edge without origin of an event is the one `execute_from_any`
-            // uses; any later one makes the choice ambiguous.
-            if edge.from.is_empty() {
-                if event_index.originless.is_none() {
-                    event_index.originless = Some(index);
-                } else if ambiguous.insert(edge.event) {
-                    errors.push(BuildError::AmbiguousOriginless { event: edge.event });
+            match fallbacks.entry(edge.event) {
+                Entry::Vacant(slot) => {
+                    let fb = if edge.from.is_empty() {
+                        FromAnyFallback::Originless(index)
+                    } else {
+                        FromAnyFallback::Single(index)
+                    };
+                    slot.insert(fb);
+                }
+                Entry::Occupied(mut slot) => {
+                    if edge.from.is_empty() {
+                        if matches!(slot.get(), FromAnyFallback::Originless(_)) {
+                            push_error(BuildError::AmbiguousOriginless(edge.event));
+                        } else {
+                            slot.insert(FromAnyFallback::Originless(index));
+                        }
+                    } else if matches!(slot.get(), FromAnyFallback::Single(_)) {
+                        slot.insert(FromAnyFallback::Multiple);
+                    }
                 }
             }
 
@@ -129,36 +213,32 @@ impl<M: Machine> EngineBuilder<M> {
                 match by_origin.entry((edge.event, *from)) {
                     Entry::Vacant(slot) => {
                         slot.insert(index);
+                        by_state.entry(*from).or_default().push(edge.event);
                     }
                     Entry::Occupied(_) => {
-                        if conflicts.insert((edge.event, *from)) {
-                            errors.push(BuildError::Conflict {
-                                event: edge.event,
-                                from: *from,
-                            });
-                        }
+                        push_error(BuildError::Conflict {
+                            event: edge.event,
+                            from: *from,
+                        });
                     }
                 }
             }
         }
 
-        let mut missing = HashSet::new();
-        for event in &self.required {
-            if !by_event.contains_key(event) && missing.insert(*event) {
-                errors.push(BuildError::MissingEvent(*event));
+        for event in &self.required_events {
+            if !fallbacks.contains_key(event) {
+                push_error(BuildError::MissingEvent(*event));
             }
         }
 
-        let mut mentioned = HashSet::new();
-        mentioned.extend(self.roots.iter().copied());
+        let mut mentioned: HashSet<M::State> = self.roots.iter().copied().collect();
         for edge in &self.edges {
             mentioned.extend(edge.from.iter().copied());
             mentioned.insert(edge.to);
         }
-        let mut missing_states = HashSet::new();
         for state in &self.required_states {
-            if !mentioned.contains(state) && missing_states.insert(*state) {
-                errors.push(BuildError::MissingState(*state));
+            if !mentioned.contains(state) {
+                push_error(BuildError::MissingState(*state));
             }
         }
 
@@ -169,9 +249,6 @@ impl<M: Machine> EngineBuilder<M> {
             loop {
                 let mut changed = false;
                 for edge in &self.edges {
-                    // An edge without origin is used by `execute_from_any` when the
-                    // current state has no edge for that event; if every reachable state
-                    // already has one, it is never selected.
                     let reached = if edge.from.is_empty() {
                         reachable
                             .iter()
@@ -188,11 +265,17 @@ impl<M: Machine> EngineBuilder<M> {
                 }
             }
 
-            let mut reported = HashSet::new();
             for edge in &self.edges {
+                if edge.from.is_empty()
+                    && reachable
+                        .iter()
+                        .all(|state| by_origin.contains_key(&(edge.event, *state)))
+                {
+                    push_error(BuildError::ShadowedOriginless(edge.event));
+                }
                 for state in edge.from.iter().chain(std::iter::once(&edge.to)) {
-                    if !reachable.contains(state) && reported.insert(*state) {
-                        errors.push(BuildError::UnreachableState(*state));
+                    if !reachable.contains(state) {
+                        push_error(BuildError::UnreachableState(*state));
                     }
                 }
             }
@@ -202,18 +285,24 @@ impl<M: Machine> EngineBuilder<M> {
             return Err(BuildErrors::new(errors));
         }
 
+        let by_event = fallbacks
+            .into_iter()
+            .map(|(event, fb)| {
+                let target = match fb {
+                    FromAnyFallback::Single(i) | FromAnyFallback::Originless(i) => Some(i),
+                    FromAnyFallback::Multiple => None,
+                };
+                (event, target)
+            })
+            .collect();
+
         Ok(Engine {
             edges: self.edges,
             roots: self.roots,
             rules: self.rules,
             by_origin,
             by_event,
+            by_state,
         })
-    }
-
-    fn push_root(&mut self, state: M::State) {
-        if !self.roots.contains(&state) {
-            self.roots.push(state);
-        }
     }
 }

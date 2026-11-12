@@ -6,14 +6,14 @@ on:
       version_bump:
         description: "Tipo de incremento de versión (SemVer)"
         required: true
-        default: "patch"
+        default: "minor"
         type: choice
         options:
           - patch
           - minor
           - major
       custom_version:
-        description: "Versión personalizada (opcional, sobreescribe el incremento. Ej. 1.0.0). Puede ser igual a la de Cargo.toml para publicarla tal cual."
+        description: "Versión SemVer personalizada (opcional, ej. 0.2.0). Para publicar la versión actual de main sin cambios usa el workflow 'Release: Create Git Tag & Publish'."
         required: false
         type: string
 
@@ -26,22 +26,18 @@ jobs:
       pull-requests: write
 
     steps:
-      - name: Manual Git Checkout
-        run: |
-          # Clonar de forma manual el repositorio usando el token de GitHub
-          git clone "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" .
-          git checkout "$GITHUB_REF_NAME"
+      - uses: actions/checkout@v5
+        with:
+          ref: main
 
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: rustfmt, clippy
 
       - name: Bump Version in Cargo.toml & CHANGELOG.md
         id: bump_version
         env:
-          # Los inputs llegan como variables de entorno, nunca interpolados en el código:
-          # así un valor como `1.0.0"; ...` no puede inyectar instrucciones en el script.
           BUMP: ${{ inputs.version_bump }}
           CUSTOM_VERSION: ${{ inputs.custom_version }}
         run: |
@@ -50,10 +46,12 @@ jobs:
           import os
           import re
           import sys
+          import tomllib
 
           SEMVER = re.compile(
               r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
-              r"(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
+              r"(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?"
+              r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
           )
 
 
@@ -67,44 +65,50 @@ jobs:
           if custom and not SEMVER.match(custom):
               fail(f"custom_version '{custom}' no es una versión SemVer válida (ej. 1.2.3)")
 
-          # 1. Cargo.toml: el campo `version` de la sección [package]
+          with open("Cargo.toml", "rb") as f:
+              current = tomllib.load(f)["package"]["version"]
+
+          if custom:
+              if custom == current:
+                  fail(
+                      f"Cargo.toml ya tiene la versión {current}. "
+                      "Ejecuta 'Release: Create Git Tag & Publish' para publicarla directamente."
+                  )
+              new = custom
+          else:
+              parts = re.match(r"^(\d+)\.(\d+)\.(\d+)$", current)
+              if not parts:
+                  fail(f"La versión actual '{current}' tiene sufijo pre-release; indica custom_version explícitamente")
+              major, minor, patch = map(int, parts.groups())
+              if bump == "major":
+                  major, minor, patch = major + 1, 0, 0
+              elif bump == "minor":
+                  minor, patch = minor + 1, 0
+              else:
+                  patch += 1
+              new = f"{major}.{minor}.{patch}"
+
           with open("Cargo.toml") as f:
               lines = f.readlines()
 
           in_package = False
-          current = new = None
+          replaced = False
           for i, line in enumerate(lines):
               stripped = line.strip()
               if stripped.startswith("["):
                   in_package = stripped == "[package]"
                   continue
-              match = re.match(r'version\s*=\s*"([^"]+)"', stripped)
-              if in_package and match:
-                  current = match.group(1)
-                  if custom:
-                      new = custom
-                  else:
-                      parts = re.match(r"(\d+)\.(\d+)\.(\d+)", current)
-                      if not parts:
-                          fail(f"La versión actual '{current}' no es SemVer")
-                      major, minor, patch = map(int, parts.groups())
-                      if bump == "major":
-                          major, minor, patch = major + 1, 0, 0
-                      elif bump == "minor":
-                          minor, patch = minor + 1, 0
-                      else:
-                          patch += 1
-                      new = f"{major}.{minor}.{patch}"
+              if in_package and re.match(r'^version\s*=\s*"[^"]+"', stripped):
                   lines[i] = f'version = "{new}"\n'
+                  replaced = True
                   break
 
-          if current is None:
-              fail("No se encontró el campo version en la sección [package] de Cargo.toml")
+          if not replaced:
+              fail("No se pudo actualizar version en [package] de Cargo.toml")
 
           with open("Cargo.toml", "w") as f:
               f.writelines(lines)
 
-          # 2. CHANGELOG.md: lo acumulado en [Unreleased] pasa a la nueva versión
           heading = "## [Unreleased]"
           with open("CHANGELOG.md") as f:
               changelog = f.read()
@@ -112,6 +116,7 @@ jobs:
               fail("CHANGELOG.md no tiene la sección '## [Unreleased]'")
           if f"## [{new}]" in changelog:
               fail(f"CHANGELOG.md ya tiene una sección para la versión {new}")
+
           rest = changelog[changelog.index(heading) + len(heading):]
           following = rest.find("\n## [")
           notes = rest if following == -1 else rest[:following]
@@ -127,16 +132,16 @@ jobs:
               out.write(f"NEW_VERSION={new}\n")
           PY
 
-      - name: Validate Compilation, Tests & Docs
+      - name: Validate Format, Tests, Clippy, Docs & Package
         env:
           RUSTDOCFLAGS: "-D warnings"
         run: |
-          # `cargo check` actualiza la versión del paquete en Cargo.lock.
-          # Las verificaciones corren aquí porque un PR creado con GITHUB_TOKEN no dispara el CI.
           cargo check
+          cargo fmt --all -- --check
           cargo test --locked
           cargo clippy --locked --all-targets -- -D warnings
           cargo doc --locked --no-deps
+          cargo package --locked --allow-dirty
 
       - name: Commit and Push Release Branch
         id: git_push
@@ -145,8 +150,8 @@ jobs:
         run: |
           BRANCH_NAME="release/v${NEW_VER}"
 
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git checkout -b "$BRANCH_NAME"
           git add Cargo.toml Cargo.lock CHANGELOG.md
@@ -158,7 +163,6 @@ jobs:
 
           git commit -m "chore(release): bump version to v${NEW_VER}"
           git push origin "$BRANCH_NAME" --force
-          echo "Pushed branch $BRANCH_NAME successfully."
           echo "BRANCH_NAME=$BRANCH_NAME" >> "$GITHUB_OUTPUT"
 
       - name: Create Pull Request via GitHub CLI
@@ -167,7 +171,6 @@ jobs:
           NEW_VER: ${{ steps.bump_version.outputs.NEW_VERSION }}
           BRANCH_NAME: ${{ steps.git_push.outputs.BRANCH_NAME }}
         run: |
-          # Verificar si ya existe un PR abierto para esa rama
           EXISTING_PR=$(gh pr list --head "$BRANCH_NAME" --state open --json number -q '.[0].number')
           if [ -n "$EXISTING_PR" ]; then
             echo "Ya existe un Pull Request abierto (#$EXISTING_PR) para la rama $BRANCH_NAME"

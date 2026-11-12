@@ -11,15 +11,16 @@ use crate::rule::{Rule, Scope, Step};
 /// The validated engine. Immutable and reusable.
 ///
 /// Built only by [`EngineBuilder::build`], which guarantees the invariants the indexes
-/// rely on: every index points into `edges`, and an event has at most one edge without
-/// origin.
+/// rely on: every index points into `edges`, and each event has a precomputed `from_any`
+/// fallback when unambiguous.
 #[must_use]
 pub struct Engine<M: Machine> {
     pub(crate) edges: Vec<CompiledEdge<M>>,
     pub(crate) roots: Vec<M::State>,
     pub(crate) rules: Vec<(Scope<M>, Box<dyn Rule<M>>)>,
     pub(crate) by_origin: HashMap<(M::Event, M::State), usize>,
-    pub(crate) by_event: HashMap<M::Event, EventIndex>,
+    pub(crate) by_event: HashMap<M::Event, Option<usize>>,
+    pub(crate) by_state: HashMap<M::State, Vec<M::Event>>,
 }
 
 impl<M: Machine> fmt::Debug for Engine<M> {
@@ -29,18 +30,8 @@ impl<M: Machine> fmt::Debug for Engine<M> {
             .field("edges", &self.edges.len())
             .field("roots", &self.roots)
             .field("rules", &rules)
-            .finish()
+            .finish_non_exhaustive()
     }
-}
-
-/// The edges of one event, as positions in `Engine::edges`.
-#[derive(Default)]
-pub(crate) struct EventIndex {
-    /// The edge without origin, if any. `build()` rejects more than one.
-    pub(crate) originless: Option<usize>,
-
-    /// Every edge of the event, in declaration order. Never empty.
-    pub(crate) edges: Vec<usize>,
 }
 
 /// Internal result of evaluating a transition, before collecting effects.
@@ -51,14 +42,38 @@ struct Evaluated<'a, M: Machine> {
 }
 
 impl<M: Machine> Evaluated<'_, M> {
-    /// The part `execute` and `diagnose` report alike.
-    fn transition(&self) -> Transition<M> {
+    fn into_transition(self) -> Transition<M> {
         Transition {
             event: self.step.event,
             from: self.step.from,
             to: self.step.to,
             rules: self.rules.iter().map(|rule| rule.name()).collect(),
             from_any: self.step.from_any,
+        }
+    }
+
+    fn into_outcome(self) -> Outcome<M> {
+        let transition = Transition {
+            event: self.step.event,
+            from: self.step.from,
+            to: self.step.to,
+            rules: self.rules.iter().map(|rule| rule.name()).collect(),
+            from_any: self.step.from_any,
+        };
+        let effects = self
+            .rules
+            .iter()
+            .flat_map(|rule| {
+                let name = rule.name();
+                rule.effects(&self.step, &self.next)
+                    .into_iter()
+                    .map(move |effect| AppliedEffect { rule: name, effect })
+            })
+            .collect();
+        Outcome {
+            transition,
+            entity: self.next,
+            effects,
         }
     }
 }
@@ -76,50 +91,51 @@ impl<M: Machine> Engine<M> {
         event: M::Event,
         input: &M::Input,
     ) -> Result<Outcome<M>, Rejection<M>> {
-        let evaluated = self.evaluate(entity, event, input, false)?;
-        Ok(self.finish(evaluated))
+        self.evaluate(entity, event, input, false)
+            .map(Evaluated::into_outcome)
     }
 
-    /// From-any execution: it ignores the origin state. Rules still run.
+    /// From-any execution: prefers an edge starting at the current state, otherwise selects
+    /// the event's originless edge or sole edge. Every rule still runs.
     pub fn execute_from_any(
         &self,
         entity: &M::Entity,
         event: M::Event,
         input: &M::Input,
     ) -> Result<Outcome<M>, Rejection<M>> {
-        let evaluated = self.evaluate(entity, event, input, true)?;
-        Ok(self.finish(evaluated))
+        self.evaluate(entity, event, input, true)
+            .map(Evaluated::into_outcome)
     }
 
     /// Events with a normal transition from the current state, in declaration order.
     ///
     /// It only looks at the topology: rules are evaluated on execution.
     #[must_use]
-    pub fn available(&self, entity: &M::Entity) -> Vec<M::Event> {
-        let state = M::state(entity);
-        self.edges
-            .iter()
-            .filter(|edge| edge.from.contains(&state))
-            .map(|edge| edge.event)
-            .collect()
+    pub fn available(&self, entity: &M::Entity) -> &[M::Event] {
+        self.by_state
+            .get(&M::state(entity))
+            .map_or(&[], Vec::as_slice)
     }
 
     /// The verdict of `execute` without the entity or the effects.
     ///
-    /// It runs the same pattern (selection, `check`, `apply`, `verify`), so an `Ok`
-    /// guarantees that `execute` would accept it too. It does not call `Rule::effects`.
+    /// It runs the same pattern (selection, `check`, `apply`, `verify`), so for pure
+    /// `Entity::clone` and rule implementations an `Ok` guarantees that `execute` would
+    /// accept it too. It does not call `Edge::effects` or `Rule::effects`.
     pub fn diagnose(&self, entity: &M::Entity, event: M::Event, input: &M::Input) -> Verdict<M> {
-        self.diagnose_run(entity, event, input, false)
+        self.evaluate(entity, event, input, false)
+            .map(Evaluated::into_transition)
     }
 
-    /// Same as `diagnose`, ignoring the origin state.
+    /// Same as `diagnose`, using from-any edge selection.
     pub fn diagnose_from_any(
         &self,
         entity: &M::Entity,
         event: M::Event,
         input: &M::Input,
     ) -> Verdict<M> {
-        self.diagnose_run(entity, event, input, true)
+        self.evaluate(entity, event, input, true)
+            .map(Evaluated::into_transition)
     }
 
     /// `diagnose` for every event in `available`, in the same order.
@@ -128,8 +144,8 @@ impl<M: Machine> Engine<M> {
     /// ("what can I do from here and why not?"). It does not include transitions without
     /// origin; those only run through `execute_from_any`.
     ///
-    /// Because guards can read `input`, the verdict is only as reliable as the `Input`
-    /// you pass. It does not call `Rule::effects`.
+    /// Because checks can read `input`, the verdict is only as reliable as the `Input`
+    /// you pass. It does not call `Edge::effects` or `Rule::effects`.
     #[must_use]
     pub fn available_detailed(
         &self,
@@ -137,8 +153,8 @@ impl<M: Machine> Engine<M> {
         input: &M::Input,
     ) -> Vec<(M::Event, Verdict<M>)> {
         self.available(entity)
-            .into_iter()
-            .map(|event| (event, self.diagnose(entity, event, input)))
+            .iter()
+            .map(|&event| (event, self.diagnose(entity, event, input)))
             .collect()
     }
 
@@ -152,7 +168,7 @@ impl<M: Machine> Engine<M> {
             .map(|&index| self.edges[index].to)
     }
 
-    /// Declared entry state: the first of [`Engine::roots`], if any.
+    /// Declared primary entry state: the first of [`Engine::roots`], if any.
     ///
     /// The engine does not create entities, but this value tells the application layer
     /// in which state a new entity is born.
@@ -165,17 +181,6 @@ impl<M: Machine> Engine<M> {
     #[must_use]
     pub fn roots(&self) -> &[M::State] {
         &self.roots
-    }
-
-    fn diagnose_run(
-        &self,
-        entity: &M::Entity,
-        event: M::Event,
-        input: &M::Input,
-        from_any: bool,
-    ) -> Verdict<M> {
-        self.evaluate(entity, event, input, from_any)
-            .map(|evaluated| evaluated.transition())
     }
 
     fn evaluate<'a>(
@@ -209,19 +214,7 @@ impl<M: Machine> Engine<M> {
             .collect();
 
         // 3. Preconditions
-        let errors: Vec<AppliedError<M>> = rules
-            .iter()
-            .filter_map(|rule| {
-                rule.check(&step).err().map(|error| AppliedError {
-                    rule: rule.name(),
-                    phase: Phase::Check,
-                    error,
-                })
-            })
-            .collect();
-        if !errors.is_empty() {
-            return Err(Rejection::Rules(errors));
-        }
+        run_phase(&rules, Phase::Check, |rule| rule.check(&step))?;
 
         // 4. Changes and new state
         let mut next = entity.clone();
@@ -229,43 +222,16 @@ impl<M: Machine> Engine<M> {
             rule.apply(&step, &mut next);
         }
         M::set_state(&mut next, edge.to);
+        debug_assert_eq!(
+            M::state(&next),
+            edge.to,
+            "Machine::set_state must update the entity state to the target state"
+        );
 
         // 5. Post-conditions over the resulting entity
-        let errors: Vec<AppliedError<M>> = rules
-            .iter()
-            .filter_map(|rule| {
-                rule.verify(&step, &next).err().map(|error| AppliedError {
-                    rule: rule.name(),
-                    phase: Phase::Verify,
-                    error,
-                })
-            })
-            .collect();
-        if !errors.is_empty() {
-            return Err(Rejection::Rules(errors));
-        }
+        run_phase(&rules, Phase::Verify, |rule| rule.verify(&step, &next))?;
 
         Ok(Evaluated { step, next, rules })
-    }
-
-    /// Collects the effects and builds the `Outcome`. Only the real execution uses it.
-    fn finish(&self, evaluated: Evaluated<'_, M>) -> Outcome<M> {
-        let transition = evaluated.transition();
-        let Evaluated { step, next, rules } = evaluated;
-        let effects: Vec<AppliedEffect<M>> = rules
-            .iter()
-            .flat_map(|rule| {
-                let name = rule.name();
-                rule.effects(&step, &next)
-                    .into_iter()
-                    .map(move |effect| AppliedEffect { rule: name, effect })
-            })
-            .collect();
-        Outcome {
-            transition,
-            entity: next,
-            effects,
-        }
     }
 
     fn select(
@@ -274,7 +240,7 @@ impl<M: Machine> Engine<M> {
         from: M::State,
         from_any: bool,
     ) -> Result<&CompiledEdge<M>, Rejection<M>> {
-        let index = self
+        let fallback = self
             .by_event
             .get(&event)
             .ok_or(Rejection::UnknownEvent(event))?;
@@ -287,15 +253,30 @@ impl<M: Machine> Engine<M> {
             return Err(Rejection::NotAllowed { event, from });
         }
 
-        // From-any: the edge without origin means "from any state".
-        if let Some(position) = index.originless {
-            return Ok(&self.edges[position]);
-        }
+        fallback
+            .map(|position| &self.edges[position])
+            .ok_or(Rejection::Ambiguous(event))
+    }
+}
 
-        // Without one, only a single edge for the event is unambiguous.
-        match index.edges.as_slice() {
-            [only] => Ok(&self.edges[*only]),
-            _ => Err(Rejection::Ambiguous(event)),
-        }
+fn run_phase<M: Machine>(
+    rules: &[&dyn Rule<M>],
+    phase: Phase,
+    mut check: impl FnMut(&dyn Rule<M>) -> Result<(), M::Error>,
+) -> Result<(), Rejection<M>> {
+    let errors: Vec<AppliedError<M>> = rules
+        .iter()
+        .filter_map(|rule| {
+            check(*rule).err().map(|error| AppliedError {
+                rule: rule.name(),
+                phase,
+                error,
+            })
+        })
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(Rejection::Rules(errors))
     }
 }

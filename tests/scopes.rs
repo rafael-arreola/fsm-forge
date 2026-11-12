@@ -1,6 +1,6 @@
 //! Scopes: where global rules apply, self-loop boundaries, and from-any mode.
 
-use fsm_forge::{Edge, Engine, Machine, Outcome, Rejection, Rule, Scope, Step, emit};
+use fsm_forge::{Edge, Engine, Machine, Outcome, Rejection, Scope, Step};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ArticleState {
@@ -27,7 +27,7 @@ struct Article {
     published: bool,
 }
 
-/// Article machine: all six scopes, self-loop boundaries, and from-any mode.
+/// Article machine: all five scopes, self-loop boundaries, and from-any mode.
 ///
 /// ```mermaid
 /// stateDiagram-v2
@@ -71,17 +71,13 @@ impl Edge<ArticleMachine> for Submit {
     const TO: ArticleState = ArticleState::Review;
 }
 
-impl Rule<ArticleMachine> for Submit {}
-
 struct Approve;
 
 impl Edge<ArticleMachine> for Approve {
     const EVENT: ArticleEvent = ArticleEvent::Approve;
     const FROM: &'static [ArticleState] = &[ArticleState::Review];
     const TO: ArticleState = ArticleState::Published;
-}
 
-impl Rule<ArticleMachine> for Approve {
     fn apply(&self, _step: &Step<'_, ArticleMachine>, article: &mut Article) {
         article.published = true;
     }
@@ -111,8 +107,6 @@ impl Edge<ArticleMachine> for Reject {
     const TO: ArticleState = ArticleState::Draft;
 }
 
-impl Rule<ArticleMachine> for Reject {}
-
 struct Retry;
 
 impl Edge<ArticleMachine> for Retry {
@@ -121,17 +115,13 @@ impl Edge<ArticleMachine> for Retry {
     const TO: ArticleState = ArticleState::Review;
 }
 
-impl Rule<ArticleMachine> for Retry {}
-
 struct Publish;
 
 impl Edge<ArticleMachine> for Publish {
     const EVENT: ArticleEvent = ArticleEvent::Publish;
     const FROM: &'static [ArticleState] = &[ArticleState::Review];
     const TO: ArticleState = ArticleState::Published;
-}
 
-impl Rule<ArticleMachine> for Publish {
     fn apply(&self, _step: &Step<'_, ArticleMachine>, article: &mut Article) {
         article.published = true;
     }
@@ -145,17 +135,13 @@ impl Edge<ArticleMachine> for Archive {
     const TO: ArticleState = ArticleState::Archived;
 }
 
-impl Rule<ArticleMachine> for Archive {}
-
 struct ForcePublish;
 
 impl Edge<ArticleMachine> for ForcePublish {
     const EVENT: ArticleEvent = ArticleEvent::ForcePublish;
     const FROM: &'static [ArticleState] = &[];
     const TO: ArticleState = ArticleState::Published;
-}
 
-impl Rule<ArticleMachine> for ForcePublish {
     fn apply(&self, _step: &Step<'_, ArticleMachine>, article: &mut Article) {
         article.published = true;
     }
@@ -170,34 +156,37 @@ fn article_engine() -> Engine<ArticleMachine> {
         .edge(Publish)
         .edge(Archive)
         .edge(ForcePublish)
-        .rule(Scope::always(), emit("always", "fx:always"))
-        .rule(
+        .emit(Scope::always(), "always", "fx:always")
+        .emit(
             Scope::on(&[ArticleEvent::Publish, ArticleEvent::Archive]),
-            emit("on", "fx:on"),
+            "on",
+            "fx:on",
         )
-        .rule(
+        .emit(
             Scope::entering(&[ArticleState::Published]),
-            emit("entering_published", "fx:entering_published"),
+            "entering_published",
+            "fx:entering_published",
         )
-        .rule(
+        .emit(
             Scope::entering(&[ArticleState::Review]),
-            emit("entering_review", "fx:entering_review"),
+            "entering_review",
+            "fx:entering_review",
         )
-        .rule(
+        .emit(
             Scope::leaving(&[ArticleState::Draft]),
-            emit("leaving_draft", "fx:leaving_draft"),
+            "leaving_draft",
+            "fx:leaving_draft",
         )
-        .rule(
+        .emit(
             Scope::leaving(&[ArticleState::Review]),
-            emit("leaving_review", "fx:leaving_review"),
+            "leaving_review",
+            "fx:leaving_review",
         )
-        .rule(
-            Scope::<ArticleMachine>::when(|step| step.from_any),
-            emit("from_any", "fx:from_any"),
-        )
-        .rule(
+        .emit(Scope::when(|step| step.from_any), "from_any", "fx:from_any")
+        .emit(
             Scope::<ArticleMachine>::when(|step| step.entity.published),
-            emit("already_published", "fx:already_published"),
+            "already_published",
+            "fx:already_published",
         )
         .initial(ArticleState::Draft)
         .require_events([
@@ -413,7 +402,7 @@ fn available_events_are_the_ones_with_an_origin_in_the_current_state() {
 
     assert_eq!(
         engine.available(&article),
-        vec![
+        &[
             ArticleEvent::Approve,
             ArticleEvent::Reject,
             ArticleEvent::Retry,

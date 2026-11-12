@@ -8,13 +8,12 @@ use crate::{Engine, Machine};
 impl<M: Machine> Engine<M> {
     /// `stateDiagram-v2` diagram generated from the declared edges.
     ///
-    /// - Ids: the state's `Debug`, sanitized and disambiguated when two states collide.
-    /// - Labels: `Machine::state_name` / `Machine::event_name`, escaped.
+    /// - Ids: sanitized from the state's `Debug` and disambiguated on collisions or
+    ///   reserved keywords.
+    /// - Labels: `Machine::state_name` / `Machine::event_name`, sanitized for Mermaid.
     /// - Edges without origin appear as a note on their target state.
     #[must_use]
     pub fn to_mermaid(&self) -> String {
-        // Every state in the diagram, once, in order of appearance: roots first, then
-        // the edges in declaration order.
         let mut seen = HashSet::new();
         let states: Vec<M::State> = self
             .roots
@@ -28,27 +27,39 @@ impl<M: Machine> Engine<M> {
             .filter(|state| seen.insert(*state))
             .collect();
 
-        // `ids` has an entry for every state in `states`, and every state below comes
-        // from the same roots and edges, so indexing cannot fail.
         let ids = assign_ids(&states);
 
-        // Writing to a `String` cannot fail, so the `fmt::Result`s are ignored.
         let mut diagram = String::from("stateDiagram-v2\n");
         for state in &states {
-            let name = label(&M::state_name(*state));
-            let _ = writeln!(diagram, "    state \"{name}\" as {}", ids[state]);
+            let id = &ids[state];
+            let name = state_label(&M::state_name(*state));
+            let display = if name.trim().is_empty() {
+                id.as_str()
+            } else {
+                name.as_str()
+            };
+            let _ = writeln!(diagram, "    state \"{display}\" as {id}");
         }
         for root in &self.roots {
             let _ = writeln!(diagram, "    [*] --> {}", ids[root]);
         }
         for edge in &self.edges {
-            let event = label(&M::event_name(edge.event));
+            let event = event_label(&M::event_name(edge.event));
             let to = &ids[&edge.to];
             if edge.from.is_empty() {
-                let _ = writeln!(diagram, "    note right of {to} : {event}");
+                let note = if event.trim().is_empty() {
+                    "(unnamed)"
+                } else {
+                    event.as_str()
+                };
+                let _ = writeln!(diagram, "    note right of {to} : {note}");
             }
             for from in &edge.from {
-                let _ = writeln!(diagram, "    {} --> {to} : {event}", ids[from]);
+                if event.trim().is_empty() {
+                    let _ = writeln!(diagram, "    {} --> {to}", ids[from]);
+                } else {
+                    let _ = writeln!(diagram, "    {} --> {to} : {event}", ids[from]);
+                }
             }
         }
         diagram
@@ -56,58 +67,65 @@ impl<M: Machine> Engine<M> {
 }
 
 /// A unique Mermaid id per state, derived from its `Debug`.
-///
-/// When two states sanitize to the same id (`"a-b"` and `"a_b"` both become `a_b`), the
-/// later one gets a numeric suffix: `a_b_2`, `a_b_3`...
 fn assign_ids<T: Copy + Eq + Hash + Debug>(states: &[T]) -> HashMap<T, String> {
-    let mut used = HashSet::new();
+    let mut used = HashSet::with_capacity(states.len());
     states
         .iter()
         .enumerate()
         .map(|(index, state)| {
             let base = id_base(state, index);
-            let mut id = base.clone();
-            let mut suffix = 2;
-            while !used.insert(id.clone()) {
-                id = format!("{base}_{suffix}");
-                suffix += 1;
-            }
+            let id = if used.contains(&base) {
+                (2..)
+                    .map(|suffix| format!("{base}_{suffix}"))
+                    .find(|candidate| !used.contains(candidate))
+                    .expect("finite set of used ids")
+            } else {
+                base
+            };
+            used.insert(id.clone());
             (*state, id)
         })
         .collect()
 }
 
-/// Id base: ASCII alphanumeric characters as-is, everything else `_`. Never empty.
+/// Id base: ASCII alphanumeric characters as-is, everything else `_`. Never empty or a
+/// reserved `stateDiagram-v2` keyword.
 fn id_base(state: &impl Debug, index: usize) -> String {
     let sanitized: String = format!("{state:?}")
         .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character
-            } else {
-                '_'
-            }
-        })
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
-    if sanitized.is_empty() {
+    if sanitized.trim_matches('_').is_empty() {
         format!("state_{index}")
+    } else if matches!(
+        sanitized.as_str(),
+        "state" | "end" | "note" | "as" | "scale" | "class" | "classDef" | "style" | "direction"
+    ) {
+        format!("{sanitized}_state")
     } else {
         sanitized
     }
 }
 
-/// A Mermaid label cannot break the line or close the string.
-fn label(text: &str) -> String {
-    text.replace('\\', "\\\\")
-        .replace('"', "'")
+/// Sanitizes a quoted state label so it cannot close the string, start a comment,
+/// terminate the statement, or break the line.
+fn state_label(text: &str) -> String {
+    text.replace('"', "'")
+        .replace(';', ",")
+        .replace("%%", "% %")
         .replace(['\n', '\r'], " ")
+}
+
+/// Sanitizes an unquoted transition or note label, also replacing `:` which splits
+/// transition descriptions in `stateDiagram-v2`.
+fn event_label(text: &str) -> String {
+    state_label(text).replace(':', ",")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A state whose `Debug` is fixed, to force collisions and empty ids.
     #[derive(Clone, Copy, PartialEq, Eq, Hash)]
     struct Raw(&'static str);
 
@@ -137,8 +155,6 @@ mod tests {
 
     #[test]
     fn a_suffix_never_reuses_an_id_already_taken() {
-        // "a_b_2" is taken by the second state, so the collision of the third with
-        // "a_b" must skip it.
         let ids = assign_ids(&[Raw("a_b"), Raw("a_b_2"), Raw("a-b")]);
 
         assert_eq!(ids[&Raw("a_b")], "a_b");
@@ -147,16 +163,45 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_debug_falls_back_to_the_position() {
-        let ids = assign_ids(&[Raw("Open"), Raw("")]);
+    fn an_empty_or_symbol_only_debug_falls_back_to_the_position() {
+        let ids = assign_ids(&[Raw("Open"), Raw(""), Raw("---")]);
 
         assert_eq!(ids[&Raw("")], "state_1");
+        assert_eq!(ids[&Raw("---")], "state_2");
     }
 
     #[test]
-    fn labels_cannot_close_the_string_or_break_the_line() {
-        assert_eq!(label("say \"hi\""), "say 'hi'");
-        assert_eq!(label("one\ntwo\r\nthree"), "one two  three");
-        assert_eq!(label("a\\b"), "a\\\\b");
+    fn reserved_mermaid_keywords_are_disambiguated() {
+        let ids = assign_ids(&[
+            Raw("end"),
+            Raw("state"),
+            Raw("note"),
+            Raw("as"),
+            Raw("class"),
+            Raw("classDef"),
+            Raw("scale"),
+            Raw("style"),
+            Raw("direction"),
+            Raw("End"),
+        ]);
+
+        assert_eq!(ids[&Raw("end")], "end_state");
+        assert_eq!(ids[&Raw("state")], "state_state");
+        assert_eq!(ids[&Raw("note")], "note_state");
+        assert_eq!(ids[&Raw("as")], "as_state");
+        assert_eq!(ids[&Raw("class")], "class_state");
+        assert_eq!(ids[&Raw("classDef")], "classDef_state");
+        assert_eq!(ids[&Raw("scale")], "scale_state");
+        assert_eq!(ids[&Raw("style")], "style_state");
+        assert_eq!(ids[&Raw("direction")], "direction_state");
+        assert_eq!(ids[&Raw("End")], "End");
+    }
+
+    #[test]
+    fn labels_sanitize_quotes_newlines_semicolons_colons_and_comments() {
+        assert_eq!(state_label("say \"hi\""), "say 'hi'");
+        assert_eq!(state_label("one\ntwo\r\nthree"), "one two  three");
+        assert_eq!(state_label("step 1; %%comment"), "step 1, % %comment");
+        assert_eq!(event_label("Retry { max: 3 }"), "Retry { max, 3 }");
     }
 }

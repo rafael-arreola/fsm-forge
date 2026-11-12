@@ -1,17 +1,15 @@
-//! The edge contract: the topology as constants; the logic comes from [`Rule`].
+//! The edge contract: topology constants and optional transition phases in one trait.
 
 use crate::machine::Machine;
-use crate::rule::Rule;
+use crate::rule::{Rule, Step, short_type_name};
 
-/// A declared edge: one event, its origins, and its destination.
+/// A declared edge: one event, its origins, its destination, and its optional logic.
 ///
-/// An edge is a [`Rule`] with fixed topology. Declare one type per transition and
-/// implement both traits on it: `Edge` for the topology (constants) and [`Rule`] for the
-/// logic (methods, all optional). An edge without logic implements [`Rule`] with an empty
-/// block:
+/// Declare one type per transition and implement `Edge` on it: the constants fix the
+/// topology and the methods (all optional) implement its logic:
 ///
 /// ```
-/// # use fsm_forge::{Edge, Machine, Rule, Step};
+/// # use fsm_forge::{Edge, Machine, Step};
 /// # #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 /// # enum Status { Draft, Issued, Archived }
 /// # #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -35,9 +33,7 @@ use crate::rule::Rule;
 ///     const EVENT: Event = Event::Issue;
 ///     const FROM: &'static [Status] = &[Status::Draft];
 ///     const TO: Status = Status::Issued;
-/// }
 ///
-/// impl Rule<InvoiceMachine> for Issue {
 ///     fn check(&self, step: &Step<'_, InvoiceMachine>) -> Result<(), &'static str> {
 ///         if step.entity.total > 0 { Ok(()) } else { Err("total must be positive") }
 ///     }
@@ -50,8 +46,6 @@ use crate::rule::Rule;
 ///     const FROM: &'static [Status] = &[Status::Issued];
 ///     const TO: Status = Status::Archived;
 /// }
-///
-/// impl Rule<InvoiceMachine> for Archive {}
 /// ```
 ///
 /// Register it with [`EngineBuilder::edge`](crate::EngineBuilder::edge). The type may
@@ -59,29 +53,76 @@ use crate::rule::Rule;
 /// built and uses it on every execution.
 ///
 /// When the same logic applies to many transitions, declare it once as a standalone
-/// [`Rule`] with a [`Scope`](crate::Scope) instead of repeating it in every edge.
-///
-/// # Register it with `.edge(...)`, never with `.rule(...)`
-///
-/// Because an edge is a [`Rule`], the compiler also accepts it in
-/// [`EngineBuilder::rule`](crate::EngineBuilder::rule), and `build()` does not report it.
-/// There, its logic would run on every transition the scope selects, not only on its own:
-/// a `check` would reject unrelated transitions, an `apply` would modify the entity on
-/// each of them, and its `effects` would be emitted everywhere. An `apply`-only edge is
-/// the hardest case to notice, because nothing fails.
-pub trait Edge<M: Machine>: Rule<M> {
+/// [`Rule`] with a [`Scope`](crate::Scope) and register it via
+/// [`EngineBuilder::rule`](crate::EngineBuilder::rule). Because `Edge` and [`Rule`] are
+/// distinct traits, the compiler prevents accidentally registering an edge as a global
+/// rule.
+pub trait Edge<M: Machine>: Send + Sync + 'static {
     /// The event that triggers this edge.
     const EVENT: M::Event;
 
     /// Origin states. Empty means the edge is only reachable through
-    /// `execute_from_any`.
+    /// `execute_from_any` or `diagnose_from_any`.
     const FROM: &'static [M::State];
 
     /// Destination state.
     const TO: M::State;
+
+    /// Precondition. `Err` rejects the transition; the errors of all rules are collected.
+    fn check(&self, _step: &Step<'_, M>) -> Result<(), M::Error> {
+        Ok(())
+    }
+
+    /// Changes to the entity. The engine moves the state after every rule has run.
+    fn apply(&self, _step: &Step<'_, M>, _entity: &mut M::Entity) {}
+
+    /// Post-condition over the already-modified entity, with the destination state set.
+    /// `Err` rejects the whole transition: no `Outcome` is produced.
+    fn verify(&self, _step: &Step<'_, M>, _next: &M::Entity) -> Result<(), M::Error> {
+        Ok(())
+    }
+
+    /// Effects the caller must run after persisting.
+    ///
+    /// `next` is the modified entity, so an effect can use computed values.
+    fn effects(&self, _step: &Step<'_, M>, _next: &M::Entity) -> Vec<M::Effect> {
+        Vec::new()
+    }
+
+    /// Name shown in [`Transition::rules`](crate::Transition::rules), in effects, and in
+    /// rejections. Defaults to the type name without module or generics.
+    fn name(&self) -> &'static str {
+        short_type_name::<Self>()
+    }
 }
 
-/// The compiled edge the engine stores: the topology plus the edge itself as its rule.
+/// Adapts an [`Edge`] into the internal [`Rule`] pipeline without making `Edge` a subtrait
+/// of `Rule` in the public API.
+struct EdgeRule<E>(E);
+
+impl<M: Machine, E: Edge<M>> Rule<M> for EdgeRule<E> {
+    fn check(&self, step: &Step<'_, M>) -> Result<(), M::Error> {
+        self.0.check(step)
+    }
+
+    fn apply(&self, step: &Step<'_, M>, entity: &mut M::Entity) {
+        self.0.apply(step, entity);
+    }
+
+    fn verify(&self, step: &Step<'_, M>, next: &M::Entity) -> Result<(), M::Error> {
+        self.0.verify(step, next)
+    }
+
+    fn effects(&self, step: &Step<'_, M>, next: &M::Entity) -> Vec<M::Effect> {
+        self.0.effects(step, next)
+    }
+
+    fn name(&self) -> &'static str {
+        self.0.name()
+    }
+}
+
+/// The compiled edge the engine stores: the topology plus the edge wrapped as a rule.
 pub(crate) struct CompiledEdge<M: Machine> {
     pub(crate) event: M::Event,
     pub(crate) from: Vec<M::State>,
@@ -102,7 +143,7 @@ impl<M: Machine> CompiledEdge<M> {
             event: E::EVENT,
             from,
             to: E::TO,
-            rule: Box::new(edge),
+            rule: Box::new(EdgeRule(edge)),
         }
     }
 }

@@ -1,7 +1,7 @@
 //! Advanced lifecycle: support ticket with scopes, reopens, timeout, and a supervisor
 //! override.
 
-use fsm_forge::{BuildErrors, Edge, Engine, Machine, Outcome, Rejection, Rule, Scope, Step, emit};
+use fsm_forge::{BuildErrors, Edge, Engine, Machine, Outcome, Rejection, Scope, Step};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Status {
@@ -169,9 +169,7 @@ impl Edge<TicketMachine> for NewDraft {
     const EVENT: Event = Event::NewDraft;
     const FROM: &'static [Status] = &[Status::Initial];
     const TO: Status = Status::Draft;
-}
 
-impl Rule<TicketMachine> for NewDraft {
     fn check(&self, step: &Step<'_, TicketMachine>) -> Result<(), &'static str> {
         expect(
             step.input.description.is_some(),
@@ -194,9 +192,7 @@ impl Edge<TicketMachine> for DirectTicketCreated {
     const EVENT: Event = Event::DirectTicketCreated;
     const FROM: &'static [Status] = &[Status::Initial];
     const TO: Status = Status::Open;
-}
 
-impl Rule<TicketMachine> for DirectTicketCreated {
     fn check(&self, step: &Step<'_, TicketMachine>) -> Result<(), &'static str> {
         expect(step.input.folio.is_some(), "missing folio")?;
         expect(step.input.priority.is_some(), "missing priority")
@@ -218,9 +214,7 @@ impl Edge<TicketMachine> for TicketSubmitted {
     const EVENT: Event = Event::TicketSubmitted;
     const FROM: &'static [Status] = &[Status::Draft];
     const TO: Status = Status::Open;
-}
 
-impl Rule<TicketMachine> for TicketSubmitted {
     fn check(&self, step: &Step<'_, TicketMachine>) -> Result<(), &'static str> {
         expect(
             step.entity.description.is_some(),
@@ -240,9 +234,7 @@ impl Edge<TicketMachine> for AgentAssigned {
     const EVENT: Event = Event::AgentAssigned;
     const FROM: &'static [Status] = &[Status::Open];
     const TO: Status = Status::Assigned;
-}
 
-impl Rule<TicketMachine> for AgentAssigned {
     fn check(&self, step: &Step<'_, TicketMachine>) -> Result<(), &'static str> {
         expect(step.input.agent.is_some(), "missing agent")
     }
@@ -262,10 +254,9 @@ impl Edge<TicketMachine> for AgentReassigned {
     const EVENT: Event = Event::AgentReassigned;
     const FROM: &'static [Status] = &[Status::Assigned];
     const TO: Status = Status::Assigned;
-}
 
-impl Rule<TicketMachine> for AgentReassigned {
     fn check(&self, step: &Step<'_, TicketMachine>) -> Result<(), &'static str> {
+        expect(step.input.agent.is_some(), "missing agent")?;
         expect(
             step.input.agent != step.entity.agent,
             "the agent is already assigned",
@@ -287,9 +278,7 @@ impl Edge<TicketMachine> for WorkStarted {
     const EVENT: Event = Event::WorkStarted;
     const FROM: &'static [Status] = &[Status::Assigned];
     const TO: Status = Status::InProgress;
-}
 
-impl Rule<TicketMachine> for WorkStarted {
     fn check(&self, step: &Step<'_, TicketMachine>) -> Result<(), &'static str> {
         expect(step.entity.agent.is_some(), "no agent assigned")
     }
@@ -309,9 +298,7 @@ impl Edge<TicketMachine> for InfoRequested {
     const EVENT: Event = Event::InfoRequested;
     const FROM: &'static [Status] = &[Status::InProgress];
     const TO: Status = Status::Waiting;
-}
 
-impl Rule<TicketMachine> for InfoRequested {
     fn check(&self, step: &Step<'_, TicketMachine>) -> Result<(), &'static str> {
         expect(step.entity.diagnosis.is_some(), "no active diagnosis")
     }
@@ -331,9 +318,7 @@ impl Edge<TicketMachine> for CustomerReplied {
     const EVENT: Event = Event::CustomerReplied;
     const FROM: &'static [Status] = &[Status::Waiting];
     const TO: Status = Status::InProgress;
-}
 
-impl Rule<TicketMachine> for CustomerReplied {
     fn check(&self, step: &Step<'_, TicketMachine>) -> Result<(), &'static str> {
         expect(step.entity.sla_paused, "the ticket is not waiting")
     }
@@ -353,9 +338,7 @@ impl Edge<TicketMachine> for FixDeployed {
     const EVENT: Event = Event::FixDeployed;
     const FROM: &'static [Status] = &[Status::InProgress];
     const TO: Status = Status::Resolved;
-}
 
-impl Rule<TicketMachine> for FixDeployed {
     fn check(&self, step: &Step<'_, TicketMachine>) -> Result<(), &'static str> {
         expect(step.entity.diagnosis.is_some(), "no diagnosis to resolve")
     }
@@ -375,9 +358,7 @@ impl Edge<TicketMachine> for FixRejected {
     const EVENT: Event = Event::FixRejected;
     const FROM: &'static [Status] = &[Status::Resolved];
     const TO: Status = Status::Reopened;
-}
 
-impl Rule<TicketMachine> for FixRejected {
     fn check(&self, step: &Step<'_, TicketMachine>) -> Result<(), &'static str> {
         expect(step.input.reason.is_some(), "missing rejection reason")
     }
@@ -394,9 +375,7 @@ impl Edge<TicketMachine> for NewDiagnosisStarted {
     const EVENT: Event = Event::NewDiagnosisStarted;
     const FROM: &'static [Status] = &[Status::Reopened];
     const TO: Status = Status::InProgress;
-}
 
-impl Rule<TicketMachine> for NewDiagnosisStarted {
     fn check(&self, step: &Step<'_, TicketMachine>) -> Result<(), &'static str> {
         expect(step.entity.reopen_count > 0, "the ticket was not reopened")
     }
@@ -412,9 +391,7 @@ impl Edge<TicketMachine> for SolutionConfirmed {
     const EVENT: Event = Event::SolutionConfirmed;
     const FROM: &'static [Status] = &[Status::Resolved];
     const TO: Status = Status::Closed;
-}
 
-impl Rule<TicketMachine> for SolutionConfirmed {
     fn check(&self, step: &Step<'_, TicketMachine>) -> Result<(), &'static str> {
         expect(step.input.confirmed, "the customer has not confirmed")?;
         expect(step.entity.resolution.is_some(), "no resolution recorded")?;
@@ -438,9 +415,7 @@ impl Edge<TicketMachine> for InactivityTimeout {
     const EVENT: Event = Event::InactivityTimeout;
     const FROM: &'static [Status] = &[Status::Waiting];
     const TO: Status = Status::Closed;
-}
 
-impl Rule<TicketMachine> for InactivityTimeout {
     fn check(&self, step: &Step<'_, TicketMachine>) -> Result<(), &'static str> {
         expect(
             step.input.inactive_hours >= self.hours,
@@ -463,9 +438,7 @@ impl Edge<TicketMachine> for SupervisorOverride {
     const EVENT: Event = Event::SupervisorOverride;
     const FROM: &'static [Status] = &[];
     const TO: Status = Status::Closed;
-}
 
-impl Rule<TicketMachine> for SupervisorOverride {
     fn check(&self, step: &Step<'_, TicketMachine>) -> Result<(), &'static str> {
         expect(step.input.actor == Actor::Supervisor, "supervisor required")
     }
@@ -477,62 +450,60 @@ impl Rule<TicketMachine> for SupervisorOverride {
 
 fn ticket_engine() -> Result<Engine<TicketMachine>, BuildErrors<TicketMachine>> {
     Engine::<TicketMachine>::builder()
-        // Creation (1000)
+        // Creation
         .edge(NewDraft)
         .edge(DirectTicketCreated)
         .edge(TicketSubmitted)
-        // Triage and diagnosis (2000)
+        // Triage and diagnosis
         .edge(AgentAssigned)
         .edge(AgentReassigned)
         .edge(WorkStarted)
         .edge(InfoRequested)
         .edge(CustomerReplied)
-        // Resolution and validation (3000)
+        // Resolution and validation
         .edge(FixDeployed)
         .edge(FixRejected)
         .edge(NewDiagnosisStarted)
-        // Closure (4000)
+        // Closure
         .edge(SolutionConfirmed)
         .edge(InactivityTimeout { hours: 72 })
         // From-any-only operation
         .edge(SupervisorOverride)
         // Global rules by scope
-        .rule(
+        .emit(
             Scope::always(),
-            emit("publish_update", TicketEffect::PublishUpdate),
+            "publish_update",
+            TicketEffect::PublishUpdate,
         )
-        .rule(
+        .emit(
             Scope::leaving(&[Status::Draft]),
-            emit(
-                "notify_submission",
-                TicketEffect::NotifyRequester("ticket_submitted"),
-            ),
+            "notify_submission",
+            TicketEffect::NotifyRequester("ticket_submitted"),
         )
-        .rule(
+        .emit(
             Scope::entering(&[Status::Open]),
-            emit("start_sla", TicketEffect::StartSla),
+            "start_sla",
+            TicketEffect::StartSla,
         )
-        .rule(
+        .emit(
             Scope::entering(&[Status::Reopened]),
-            emit(
-                "alert_recurrence",
-                TicketEffect::NotifyRequester("recurrence"),
-            ),
+            "alert_recurrence",
+            TicketEffect::NotifyRequester("recurrence"),
         )
-        .rule(
+        .emit(
             Scope::when(|step| step.from == Status::Assigned),
-            emit("sync_assignment", TicketEffect::SyncAssignment),
+            "sync_assignment",
+            TicketEffect::SyncAssignment,
         )
-        .rule(
+        .emit(
             Scope::on(&[Event::FixRejected]),
-            emit(
-                "notify_rejection",
-                TicketEffect::NotifyRequester("fix_rejected"),
-            ),
+            "notify_rejection",
+            TicketEffect::NotifyRequester("fix_rejected"),
         )
-        .rule(
+        .emit(
             Scope::when(|step| step.from_any),
-            emit("override_audit", TicketEffect::AuditOverride),
+            "override_audit",
+            TicketEffect::AuditOverride,
         )
         .initial(Status::Initial)
         .require_events([
@@ -596,7 +567,7 @@ fn effects(outcome: &Outcome<TicketMachine>) -> Vec<TicketEffect> {
 
 fn open_ticket(engine: &Engine<TicketMachine>) -> Ticket {
     let mut ticket = Ticket::initial();
-    execute(
+    let _ = execute(
         engine,
         &mut ticket,
         Event::DirectTicketCreated,
@@ -612,7 +583,7 @@ fn open_ticket(engine: &Engine<TicketMachine>) -> Ticket {
 
 fn assigned_ticket(engine: &Engine<TicketMachine>) -> Ticket {
     let mut ticket = open_ticket(engine);
-    execute(
+    let _ = execute(
         engine,
         &mut ticket,
         Event::AgentAssigned,
@@ -627,7 +598,7 @@ fn assigned_ticket(engine: &Engine<TicketMachine>) -> Ticket {
 
 fn in_progress_ticket(engine: &Engine<TicketMachine>) -> Ticket {
     let mut ticket = assigned_ticket(engine);
-    execute(
+    let _ = execute(
         engine,
         &mut ticket,
         Event::WorkStarted,
@@ -642,7 +613,7 @@ fn in_progress_ticket(engine: &Engine<TicketMachine>) -> Ticket {
 
 fn resolved_ticket(engine: &Engine<TicketMachine>) -> Ticket {
     let mut ticket = in_progress_ticket(engine);
-    execute(
+    let _ = execute(
         engine,
         &mut ticket,
         Event::FixDeployed,
@@ -656,7 +627,7 @@ fn resolved_ticket(engine: &Engine<TicketMachine>) -> Ticket {
 
 fn waiting_ticket(engine: &Engine<TicketMachine>) -> Ticket {
     let mut ticket = in_progress_ticket(engine);
-    execute(
+    let _ = execute(
         engine,
         &mut ticket,
         Event::InfoRequested,
@@ -743,7 +714,7 @@ fn draft_requires_a_description() {
 fn submission_requires_a_folio_and_starts_the_sla() {
     let engine = ticket_engine().expect("valid ticket machine");
     let mut ticket = Ticket::initial();
-    execute(
+    let _ = execute(
         &engine,
         &mut ticket,
         Event::NewDraft,
@@ -986,9 +957,11 @@ fn solution_confirmation_requires_the_customer_and_rejects_override() {
         "SolutionConfirmed"
     );
 
+    let mut non_resolved = in_progress_ticket(&engine);
+    non_resolved.resolution = Some("hotfix");
     let rejection = engine
         .execute_from_any(
-            &ticket,
+            &non_resolved,
             Event::SolutionConfirmed,
             &Command {
                 actor: Actor::Supervisor,
@@ -996,12 +969,12 @@ fn solution_confirmation_requires_the_customer_and_rejects_override() {
                 ..Command::default()
             },
         )
-        .expect_err("the transition is not overridable");
+        .expect_err("the transition is not overridable even from another state");
     assert_eq!(
         rejection.rules().expect("rule rejection")[0].rule,
         "SolutionConfirmed"
     );
-    assert_eq!(ticket.status, Status::Resolved);
+    assert_eq!(non_resolved.status, Status::InProgress);
 
     let outcome = execute(
         &engine,
@@ -1112,7 +1085,7 @@ fn available_and_available_detailed_explain_the_next_actions() {
     let engine = ticket_engine().expect("valid ticket machine");
     let ticket = open_ticket(&engine);
 
-    assert_eq!(engine.available(&ticket), vec![Event::AgentAssigned]);
+    assert_eq!(engine.available(&ticket), &[Event::AgentAssigned]);
 
     let detailed = engine.available_detailed(&ticket, &Command::default());
     assert_eq!(detailed.len(), 1);
@@ -1127,40 +1100,7 @@ fn available_and_available_detailed_explain_the_next_actions() {
     let assigned = assigned_ticket(&engine);
     assert_eq!(
         engine.available(&assigned),
-        vec![Event::AgentReassigned, Event::WorkStarted]
-    );
-}
-
-#[test]
-fn happy_path_reaches_closed_with_all_effects() {
-    let engine = ticket_engine().expect("valid ticket machine");
-    let mut ticket = in_progress_ticket(&engine);
-
-    execute(
-        &engine,
-        &mut ticket,
-        Event::FixDeployed,
-        Command {
-            actor: Actor::Agent,
-            ..Command::default()
-        },
-    );
-    assert_eq!(ticket.status, Status::Resolved);
-
-    let outcome = execute(
-        &engine,
-        &mut ticket,
-        Event::SolutionConfirmed,
-        Command {
-            actor: Actor::Requester,
-            confirmed: true,
-            ..Command::default()
-        },
-    );
-    assert_eq!(ticket.status, Status::Closed);
-    assert_eq!(
-        effects(&outcome),
-        vec![TicketEffect::SendSurvey, TicketEffect::PublishUpdate]
+        &[Event::AgentReassigned, Event::WorkStarted]
     );
 }
 
